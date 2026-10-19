@@ -442,6 +442,10 @@ async def biz_text(msg: Message, bot: Bot):
     is_owner = msg.from_user.id == owner
     log.info("business_message chat=%s from=%s owner=%s text=%r", msg.chat.id, msg.from_user.id, is_owner, text[:60])
 
+    # диагностика: владелец пишет /bottest в чате — бот пробует 3 вида сообщений и сообщает результат
+    if is_owner and text.lower() in {"/bottest", "/тест"} and msg.chat.id != owner:
+        return await business_selftest(msg, bot, bc_id, owner)
+
     # владелец создаёт оффер: «@бот ссылка 700 120»
     # имя бота сверяем терпимо: цифра 0, латинская o и русская о считаются одним символом
     def _norm(t: str) -> str:
@@ -485,6 +489,41 @@ async def biz_text(msg: Message, bot: Bot):
 
 
 _TASKS: set = set()
+
+
+async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> None:
+    """Проверяет, какие сообщения Telegram разрешает слать от вашего имени (чтобы понять причину PEER_FLOOD)."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✓ Тест", callback_data="noop:0")]])
+    variants = [
+        ("1. обычный текст", "Тест 1: обычный текст", None),
+        ("2. текст со ссылкой на подарок", "Тест 2: https://t.me/nft/MirageLamp-71292", None),
+        ("3. текст с кнопкой", "Тест 3: с кнопкой", kb),
+    ]
+    results = []
+    for name, t, k in variants:
+        try:
+            m = await bot.send_message(
+                msg.chat.id, t, reply_markup=k, business_connection_id=bc_id,
+                link_preview_options=PREVIEW_OFF,
+            )
+            results.append(f"✅ {name}")
+            try:
+                await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[m.message_id])
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            results.append(f"❌ {name}: {e}")
+        await asyncio.sleep(1)
+    report = "🧪 Результат теста отправки от вашего имени:\n" + "\n".join(results)
+    log.info(report.replace("\n", " | "))
+    try:
+        await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    try:
+        await bot.send_message(owner, escape(report))
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
 
 
 async def _second_edit(bot: Bot, o: dict) -> None:
