@@ -499,8 +499,23 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         "seller_name": None,
         "msgs": {},
     }
+    # 1) пробуем просто заменить ваше сообщение оффером (без отправки нового)
+    mid, edited = None, False
+    text, kb, lp = render(o, "shared", bc_id)
     try:
-        mid = await send_view(bot, msg.chat.id, render(o, "shared", bc_id), bc_id)
+        await bot.edit_message_text(
+            text=text, chat_id=msg.chat.id, message_id=msg.message_id,
+            business_connection_id=bc_id, reply_markup=kb, link_preview_options=lp,
+        )
+        mid, edited = msg.message_id, True
+        log.info("offer: edited the owner's message in place")
+    except (TelegramForbiddenError, TelegramBadRequest) as e:
+        log.info("edit in place failed (%s), sending a new message", e)
+
+    # 2) если не вышло — отправляем новое сообщение от вашего имени
+    try:
+        if mid is None:
+            mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         log.warning("business send failed: %s", e)
         # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
@@ -516,11 +531,12 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
     OFFERS[o["id"]] = o
 
-    # убираем саму команду «/offer ...» из чата (нужно право на удаление сообщений)
-    try:
-        await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
-    except (TelegramBadRequest, TelegramForbiddenError) as e:
-        log.info("can't delete command message: %s", e)
+    # убираем исходную команду из чата (нужно право на удаление сообщений), если не редактировали её
+    if not edited:
+        try:
+            await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            log.info("can't delete command message: %s", e)
 
 
 def get_offer(cb: CallbackQuery) -> dict | None:
