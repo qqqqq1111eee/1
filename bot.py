@@ -9,7 +9,7 @@ from html import escape
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BusinessConnection,
@@ -28,8 +28,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("offer_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# Кнопки под оффером в бизнес-чатах. Если Telegram пометит такие сообщения «via @бот»,
-# поставь на Railway OFFER_BUTTONS=0 — тогда останутся только ответы словами.
+# Кнопки под оффером в бизнес-чатах. Метка «By @бот» от кнопок НЕ зависит: Telegram сам
+# ставит её (только владельцу аккаунта) на любое сообщение, отправленное бизнес-ботом.
+# OFFER_BUTTONS=0 — убрать кнопки, останутся только ответы словами.
 BUTTONS = os.getenv("OFFER_BUTTONS", "1") == "1"
 # Дублировать оффер получателю в личку с ботом (OFFER_DM=1 — включить; нужен /start у получателя).
 ALSO_DM = os.getenv("OFFER_DM", "0") == "1"
@@ -102,7 +103,8 @@ def gift_title(url: str) -> str:
 def money(o: dict) -> str:
     if o["currency"] == "stars":
         return f"{o['price']} ★"
-    return f"{o['price']:,} Gram"
+    p = o["price"]
+    return f"{p:,.2f}".rstrip("0").rstrip(".") + " Gram" if isinstance(p, float) else f"{p:,} Gram"
 
 
 def cur_name(o: dict) -> str:
@@ -164,7 +166,7 @@ def render(o: dict, role: str, bc_id: str | None = None):
 def parse_query(text: str) -> dict | None:
     """Формат: <цена> <ссылка на подарок> [минуты] [stars|gram] [@username]"""
     link = None
-    nums: list[int] = []
+    nums: list[int | float] = []
     currency = "stars"
     for tok in text.split():
         low = tok.lower()
@@ -174,11 +176,16 @@ def parse_query(text: str) -> dict | None:
             currency = "gram"
         elif low in {"stars", "star", "зв", "звезд", "звезды", "⭐", "★"}:
             currency = "stars"
-        elif re.fullmatch(r"\d[\d,_]*", tok):
-            nums.append(int(re.sub(r"[,_]", "", tok)))
+        elif re.fullmatch(r"\d[\d,_]*(?:\.\d+)?", tok):
+            clean = re.sub(r"[,_]", "", tok)
+            nums.append(float(clean) if "." in clean else int(clean))
     if not link or not nums or nums[0] <= 0:
         return None
-    minutes = nums[1] if len(nums) > 1 else 60
+    if currency == "stars" and nums[0] != int(nums[0]):
+        return None  # у Stars не бывает дробных значений
+    if currency == "stars":
+        nums[0] = int(nums[0])
+    minutes = int(nums[1]) if len(nums) > 1 else 60
     minutes = max(1, min(minutes, 24 * 60))
     return {"url": link, "price": nums[0], "minutes": minutes, "currency": currency}
 
@@ -300,10 +307,10 @@ async def refresh(bot: Bot, o: dict) -> None:
                 o["msgs"][role] = (chat_id, m.message_id, bc_id)
                 try:
                     await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message_id])
-                except (TelegramBadRequest, TelegramForbiddenError) as e:
+                except TelegramAPIError as e:
                     log.info("can't delete old offer message: %s", e)
                 continue
-            except (TelegramBadRequest, TelegramForbiddenError) as e:
+            except TelegramAPIError as e:
                 log.warning("resend failed (%s), editing instead", e)
 
         try:
@@ -427,7 +434,7 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
             o["msgs"]["buyer"] = (msg.chat.id, await send_view(bot, msg.chat.id, view_for(o, "buyer")), None)
         else:
             o["msgs"]["shared"] = (msg.chat.id, await send_view(bot, msg.chat.id, view_for(o, "shared")), None)
-    except (TelegramForbiddenError, TelegramBadRequest) as e:
+    except TelegramAPIError as e:
         log.warning("send failed: %s", e)
         return await msg.answer("Не получилось отправить оффер: получатель должен нажать /start у бота.")
 
@@ -538,30 +545,51 @@ async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> N
             InlineKeyboardButton(text="✕ Отклонить", callback_data="noop:2"),
         ]])),
     ]
+    # 6-7: настоящий оффер — тот же render(), те же preview и tg://user-ссылка, что и в бою
+    fake = {
+        "id": "selftest", "buyer_id": owner, "target_id": msg.chat.id,
+        "target_name": msg.chat.full_name, "url": "https://t.me/nft/MirageLamp-71292",
+        "title": "Mirage Lamp #71292", "price": 1500, "currency": "stars",
+        "expires": time.time() + 3600, "status": "pending",
+        "seller_id": None, "seller_name": None, "msgs": {},
+    }
+    t6, k6, lp6 = render(fake, "shared", bc_id)
+    variants.append(("6. НАСТОЯЩИЙ оффер (как в бою: ссылка на профиль + карточка подарка + кнопки)", t6, k6, lp6))
+    fake["strip_links"] = True
+    t7, k7, lp7 = render(fake, "shared", bc_id)
+    variants.append(("7. оффер без ссылки на профиль", t7, k7, lp7))
+
     results = []
-    for name, t, k in variants:
+    delete_error = None
+    for name, t, k, *rest in variants:
+        lp = rest[0] if rest else PREVIEW_OFF
         try:
             m = await bot.send_message(
                 msg.chat.id, t, reply_markup=k, business_connection_id=bc_id,
-                link_preview_options=PREVIEW_OFF,
+                link_preview_options=lp,
             )
             results.append(f"✅ {name}")
             try:
                 await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[m.message_id])
-            except (TelegramBadRequest, TelegramForbiddenError):
-                pass
-        except (TelegramBadRequest, TelegramForbiddenError) as e:
-            results.append(f"❌ {name}: {e}")
+            except TelegramAPIError as e:
+                delete_error = f"{type(e).__name__}: {e}"
+        except TelegramAPIError as e:
+            results.append(f"❌ {name}: {type(e).__name__}: {e}")
         await asyncio.sleep(1)
+    if delete_error:
+        results.append(
+            "⚠️ Удалить тестовые сообщения не удалось (" + delete_error + "). "
+            "Включи боту право «Удаление сообщений» в Настройки → Telegram для бизнеса → Чат-боты."
+        )
     report = "🧪 Результат теста отправки от вашего имени:\n" + "\n".join(results)
     log.info(report.replace("\n", " | "))
     try:
         await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
-    except (TelegramBadRequest, TelegramForbiddenError):
+    except TelegramAPIError:
         pass
     try:
         await bot.send_message(owner, escape(report))
-    except (TelegramBadRequest, TelegramForbiddenError):
+    except TelegramAPIError:
         pass
 
 
@@ -624,9 +652,9 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
             log.info("offer: sent as a new business message (variant %s)", flags or "full")
             break
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
+        except TelegramAPIError as e:
             err = e
-            log.warning("business send failed (variant %s): %s", flags or "full", e)
+            log.warning("business send failed (variant %s): %s: %s", flags or "full", type(e).__name__, e)
 
     # 2) запасной вариант: заменить ваше сообщение (получатель такую правку может не увидеть)
     if mid is None:
@@ -638,7 +666,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             )
             mid, edited = msg.message_id, True
             log.info("offer: edited the owner's message in place (fallback)")
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
+        except TelegramAPIError as e:
             log.warning("edit in place failed: %s", e)
 
     if mid is None:
@@ -649,7 +677,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
                 f"⚠️ Не удалось отправить оффер в чат с {escape(msg.chat.full_name or str(msg.chat.id))}:\n"
                 f"<code>{escape(str(err))}</code>",
             )
-        except (TelegramBadRequest, TelegramForbiddenError):
+        except TelegramAPIError:
             pass
         return
     o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
@@ -666,25 +694,26 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     if ALSO_DM:
         try:
             o["msgs"]["seller"] = (msg.chat.id, await send_view(bot, msg.chat.id, view_for(o, "seller")), None)
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
+        except TelegramAPIError as e:
             log.info("dm to recipient failed: %s", e)
             try:
                 await bot.send_message(
                     msg.from_user.id,
                     "ℹ️ Получатель пока не видит кнопки в личке с ботом: ему нужно один раз нажать /start у бота.",
                 )
-            except (TelegramBadRequest, TelegramForbiddenError):
+            except TelegramAPIError:
                 pass
 
     # убираем исходную команду из чата (нужно право на удаление сообщений), если не редактировали её
     if not edited:
         try:
             await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
-        except (TelegramBadRequest, TelegramForbiddenError) as e:
-            log.info("can't delete command message: %s", e)
+        except TelegramAPIError as e:
+            log.warning("can't delete command message (нет права «Удаление сообщений» у бота в Telegram Business?): %s", e)
 
 
 def get_offer(cb: CallbackQuery) -> dict | None:
+    log.info("callback %s from user %s", cb.data, cb.from_user.id)
     o = OFFERS.get(cb.data.split(":", 1)[1])
     if o and cb.inline_message_id and "shared" not in o["msgs"]:
         o["msgs"]["shared"] = (None, cb.inline_message_id, None)
