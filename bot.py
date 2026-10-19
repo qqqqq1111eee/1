@@ -33,6 +33,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BUTTONS = os.getenv("OFFER_BUTTONS", "1") == "1"
 # Дублировать оффер получателю в личку с ботом (OFFER_DM=1 — включить; нужен /start у получателя).
 ALSO_DM = os.getenv("OFFER_DM", "0") == "1"
+# После каждого шага сделки слать в бизнес-чат новое сообщение вместо правки старого (OFFER_RESEND=0 — только правки).
+RESEND = os.getenv("OFFER_RESEND", "1") == "1"
 
 dp = Dispatcher()
 
@@ -142,6 +144,8 @@ def render(o: dict, role: str, bc_id: str | None = None):
         text = re.sub(r'<a href="tg://user\?id=\d+">(.*?)</a>', r"\1", text)
     if o.get("simple_preview") and not lp.is_disabled:
         lp = LinkPreviewOptions(url=o["url"])
+    if o.get("auto_preview") and not lp.is_disabled:
+        lp = None  # без параметров: Telegram сам подтянет карточку по ссылке на подарок в тексте
     if o.get("no_preview"):
         lp = PREVIEW_OFF
     if bc_id and not BUTTONS:
@@ -277,8 +281,26 @@ def view_for(o: dict, role: str):
 
 async def refresh(bot: Bot, o: dict) -> None:
     """Обновляет все сообщения оффера (у получателя и у покупателя)."""
-    for role, (chat_id, message_id, bc_id) in o["msgs"].items():
+    for role, (chat_id, message_id, bc_id) in list(o["msgs"].items()):
         text, kb, lp = render(o, role, bc_id)
+
+        # Правки сообщений, отправленных от имени владельца, получатель может не увидеть.
+        # Поэтому в бизнес-чатах шлём НОВОЕ сообщение с актуальным состоянием, а старое удаляем.
+        if bc_id and chat_id is not None and RESEND:
+            try:
+                m = await bot.send_message(
+                    chat_id, text, reply_markup=kb, link_preview_options=lp,
+                    business_connection_id=bc_id,
+                )
+                o["msgs"][role] = (chat_id, m.message_id, bc_id)
+                try:
+                    await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message_id])
+                except (TelegramBadRequest, TelegramForbiddenError) as e:
+                    log.info("can't delete old offer message: %s", e)
+                continue
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                log.warning("resend failed (%s), editing instead", e)
+
         try:
             if chat_id is None:  # сообщение, отправленное через inline
                 await bot.edit_message_text(
@@ -579,11 +601,12 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     attempts = [
         {},
         {"strip_links": True},
+        {"strip_links": True, "auto_preview": True},
         {"strip_links": True, "simple_preview": True},
         {"strip_links": True, "no_preview": True},
     ]
     for flags in attempts:
-        for k_ in ("strip_links", "simple_preview", "no_preview"):
+        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview"):
             o.pop(k_, None)
         o.update(flags)
         text, kb, lp = render(o, "shared", bc_id)
