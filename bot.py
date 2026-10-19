@@ -370,7 +370,10 @@ async def on_inline(q: InlineQuery):
     """Если в BotFather включён Inline Mode, клиент ждёт ответа на «@бот ...».
     Отвечаем сразу пустым списком — тогда сообщение уходит как обычный текст,
     а его подхватывает business-обработчик ниже."""
-    await q.answer([], cache_time=0, is_personal=True)
+    try:
+        await q.answer([], cache_time=0, is_personal=True)
+    except TelegramBadRequest as e:
+        log.info("inline answer failed: %s", e)
 
 
 @dp.business_message(F.text)
@@ -417,6 +420,15 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         mid = await send_view(bot, msg.chat.id, view_for(o, "shared"), bc_id)
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         log.warning("business send failed: %s", e)
+        # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
+        try:
+            await bot.send_message(
+                msg.from_user.id,
+                f"⚠️ Не удалось отправить оффер в чат с {escape(msg.chat.full_name or str(msg.chat.id))}:\n"
+                f"<code>{escape(str(e))}</code>",
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
         return
     o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
     OFFERS[o["id"]] = o
