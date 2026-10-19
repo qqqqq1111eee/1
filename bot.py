@@ -31,6 +31,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 # Кнопки под оффером в бизнес-чатах. Если Telegram пометит такие сообщения «via @бот»,
 # поставь на Railway OFFER_BUTTONS=0 — тогда останутся только ответы словами.
 BUTTONS = os.getenv("OFFER_BUTTONS", "1") == "1"
+# Дублировать оффер получателю в личку с ботом (OFFER_DM=1 — включить; нужен /start у получателя).
+ALSO_DM = os.getenv("OFFER_DM", "0") == "1"
 
 dp = Dispatcher()
 
@@ -482,6 +484,25 @@ async def biz_text(msg: Message, bot: Bot):
     await refresh(bot, o)
 
 
+_TASKS: set = set()
+
+
+async def _second_edit(bot: Bot, o: dict) -> None:
+    for delay in (2.0, 5.0):  # на всякий случай два раза
+        await asyncio.sleep(delay)
+        text, kb, lp = render(o, "shared", o["msgs"]["shared"][2])
+        try:
+            await bot.edit_message_text(
+                text=text + ("" if delay == 2.0 else "\u200b"),  # чередуем, чтобы правка отличалась от предыдущей
+                chat_id=o["msgs"]["shared"][0], message_id=o["msgs"]["shared"][1],
+                business_connection_id=o["msgs"]["shared"][2],
+                reply_markup=kb, link_preview_options=lp,
+            )
+            log.info("second edit done (delay %s)", delay)
+        except TelegramBadRequest as e:
+            log.info("second edit failed: %s", e)
+
+
 async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     """Оффер от имени владельца аккаунта (без «via @bot»)."""
     data = parse_query(args)
@@ -509,7 +530,8 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     text, kb, lp = render(o, "shared", bc_id)
     try:
         await bot.edit_message_text(
-            text=text, chat_id=msg.chat.id, message_id=msg.message_id,
+            text=text + "\u200b",  # невидимый символ: вторая правка ниже будет отличаться от первой
+            chat_id=msg.chat.id, message_id=msg.message_id,
             business_connection_id=bc_id, reply_markup=kb, link_preview_options=lp,
         )
         mid, edited = msg.message_id, True
@@ -535,6 +557,27 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         return
     o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
     OFFERS[o["id"]] = o
+
+    # Первая правка чужого сообщения доходит только до владельца, вторая — до получателя.
+    # Поэтому через пару секунд правим ещё раз (убираем невидимый символ).
+    if edited:
+        t = asyncio.create_task(_second_edit(bot, o))
+        _TASKS.add(t)
+        t.add_done_callback(_TASKS.discard)
+
+    # запасной канал: дублируем оффер получателю в личку с ботом (нужно, чтобы он хоть раз нажал /start)
+    if ALSO_DM:
+        try:
+            o["msgs"]["seller"] = (msg.chat.id, await send_view(bot, msg.chat.id, view_for(o, "seller")), None)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            log.info("dm to recipient failed: %s", e)
+            try:
+                await bot.send_message(
+                    msg.from_user.id,
+                    "ℹ️ Получатель пока не видит кнопки в личке с ботом: ему нужно один раз нажать /start у бота.",
+                )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                pass
 
     # убираем исходную команду из чата (нужно право на удаление сообщений), если не редактировали её
     if not edited:
