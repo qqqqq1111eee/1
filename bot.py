@@ -525,32 +525,37 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         "seller_name": None,
         "msgs": {},
     }
-    # 1) пробуем просто заменить ваше сообщение оффером (без отправки нового)
-    mid, edited = None, False
+    mid, edited, err = None, False, None
     text, kb, lp = render(o, "shared", bc_id)
-    try:
-        await bot.edit_message_text(
-            text=text + "\u200b",  # невидимый символ: вторая правка ниже будет отличаться от первой
-            chat_id=msg.chat.id, message_id=msg.message_id,
-            business_connection_id=bc_id, reply_markup=kb, link_preview_options=lp,
-        )
-        mid, edited = msg.message_id, True
-        log.info("offer: edited the owner's message in place")
-    except (TelegramForbiddenError, TelegramBadRequest) as e:
-        log.info("edit in place failed (%s), sending a new message", e)
 
-    # 2) если не вышло — отправляем новое сообщение от вашего имени
+    # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель
     try:
-        if mid is None:
-            mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
+        mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
+        log.info("offer: sent as a new business message")
     except (TelegramForbiddenError, TelegramBadRequest) as e:
+        err = e
         log.warning("business send failed: %s", e)
+
+    # 2) запасной вариант: заменить ваше сообщение (получатель такую правку может не увидеть)
+    if mid is None:
+        try:
+            await bot.edit_message_text(
+                text=text + "\u200b",
+                chat_id=msg.chat.id, message_id=msg.message_id,
+                business_connection_id=bc_id, reply_markup=kb, link_preview_options=lp,
+            )
+            mid, edited = msg.message_id, True
+            log.info("offer: edited the owner's message in place (fallback)")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            log.warning("edit in place failed: %s", e)
+
+    if mid is None:
         # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
         try:
             await bot.send_message(
                 msg.from_user.id,
                 f"⚠️ Не удалось отправить оффер в чат с {escape(msg.chat.full_name or str(msg.chat.id))}:\n"
-                f"<code>{escape(str(e))}</code>",
+                f"<code>{escape(str(err))}</code>",
             )
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
