@@ -666,6 +666,16 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             )
             mid, edited = msg.message_id, True
             log.info("offer: edited the owner's message in place (fallback)")
+            # новое сообщение отправить не удалось — сообщаем владельцу почему (получатель в этом режиме часто ничего не видит)
+            try:
+                await bot.send_message(
+                    msg.from_user.id,
+                    "⚠️ Новое сообщение с оффером Telegram не принял, поэтому я отредактировал твоё сообщение "
+                    "(в этом режиме получатель может не увидеть оффер).\n"
+                    f"Причина: <code>{escape(type(err).__name__ + ': ' + str(err))}</code>",
+                )
+            except TelegramAPIError:
+                pass
         except TelegramAPIError as e:
             log.warning("edit in place failed: %s", e)
 
