@@ -701,6 +701,11 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         except TelegramAPIError as e:
             err = e
             errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
+            if "PEER_FLOOD" in str(e):
+                # Telegram режет ЛЮБОЕ новое сообщение в этот чат — упрощать текст бесполезно,
+                # а повторные попытки только ухудшают лимиты. Сразу переходим к правке.
+                log.warning("PEER_FLOOD: новые сообщения в чат %s запрещены, остальные варианты пропущены", msg.chat.id)
+                break
             log.warning("business send failed (variant %s): %s: %s", flags or "full", type(e).__name__, e)
 
     if mid is not None and errs:
