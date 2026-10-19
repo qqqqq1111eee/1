@@ -15,6 +15,7 @@ from aiogram.types import (
     BusinessConnection,
     CallbackQuery,
     InlineKeyboardButton,
+    InlineQuery,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
@@ -364,6 +365,14 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
     OFFERS[o["id"]] = o
 
 
+@dp.inline_query()
+async def on_inline(q: InlineQuery):
+    """Если в BotFather включён Inline Mode, клиент ждёт ответа на «@бот ...».
+    Отвечаем сразу пустым списком — тогда сообщение уходит как обычный текст,
+    а его подхватывает business-обработчик ниже."""
+    await q.answer([], cache_time=0, is_personal=True)
+
+
 @dp.business_message(F.text)
 async def biz_mention(msg: Message, bot: Bot):
     """Владелец пишет в любом личном чате «@бот 1500 ссылка 60» — бот заменяет это оффером от его имени."""
@@ -371,10 +380,13 @@ async def biz_mention(msg: Message, bot: Bot):
     me = await bot.me()
     text = (msg.text or "").strip()
     prefix = "@" + (me.username or "").lower()
+    log.info("business_message chat=%s from=%s text=%r", msg.chat.id, msg.from_user and msg.from_user.id, text[:60])
     if not bc_id or not text.lower().startswith(prefix):
+        log.info("skip: text doesn't start with %s", prefix)
         return
     owner = await business_owner(bot, bc_id)
     if owner is None or not msg.from_user or msg.from_user.id != owner:
+        log.info("skip: sender %s is not owner %s", msg.from_user and msg.from_user.id, owner)
         return
     await business_offer(msg, text[len(prefix):].strip(), bot, bc_id)
 
@@ -383,6 +395,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     """Оффер от имени владельца аккаунта (без «via @bot»)."""
     data = parse_query(args)
     if not data or msg.chat.type != "private" or msg.chat.id == msg.from_user.id:
+        log.info("skip offer: parse=%s chat_type=%s self_chat=%s", bool(data), msg.chat.type, msg.chat.id == msg.from_user.id)
         return  # молча игнорируем, чтобы не светить ошибки собеседнику
 
     o = {
@@ -505,7 +518,7 @@ async def main():
     await dp.start_polling(
         bot,
         allowed_updates=[
-            "message", "callback_query",
+            "message", "callback_query", "inline_query",
             "business_connection", "business_message",
             "edited_business_message", "deleted_business_messages",
         ],
