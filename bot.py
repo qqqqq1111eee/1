@@ -172,6 +172,10 @@ def render(o: dict, role: str, bc_id: str | None = None):
     if o.get("no_timer"):
         # диагностика показала: ссылка на подарок + строка про срок в одном сообщении → PEER_FLOOD
         text = re.sub(r"\n\n🕒[^\n]*$", "", text)
+    if o.get("plain_gift"):
+        # без ссылки на подарок в тексте (ссылка + слова про продажу/передачу провоцируют PEER_FLOOD)
+        text = re.sub(r'<a href="https?://t\.me/nft/[^"]+">(.*?)</a>', r"\1", text)
+        lp = PREVIEW_OFF
     if o.get("simple_preview") and not lp.is_disabled:
         lp = LinkPreviewOptions(url=o["url"])
     if o.get("raw_url"):
@@ -183,6 +187,10 @@ def render(o: dict, role: str, bc_id: str | None = None):
         lp = None  # без параметров: Telegram сам подтянет карточку по ссылке на подарок в тексте
     if o.get("no_preview"):
         lp = PREVIEW_OFF
+    if kb and o.get("no_url_buttons"):
+        rows = [[b for b in row if not b.url] for row in kb.inline_keyboard]
+        rows = [r for r in rows if r]
+        kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
     if bc_id and DEEPLINK:
         kb = deeplink_kb(kb)
     if bc_id and (not BUTTONS or o.get("no_buttons")):
@@ -329,19 +337,45 @@ async def refresh(bot: Bot, o: dict) -> None:
         # Правки сообщений, отправленных от имени владельца, получатель может не увидеть.
         # Поэтому в бизнес-чатах шлём НОВОЕ сообщение с актуальным состоянием, а старое удаляем.
         if bc_id and chat_id is not None and RESEND:
-            try:
-                m = await bot.send_message(
-                    chat_id, text, reply_markup=kb, link_preview_options=lp,
-                    business_connection_id=bc_id,
-                )
+            ladder = [
+                {"plain_gift": True},
+                {"plain_gift": True, "no_url_buttons": True},
+                {"plain_gift": True, "no_url_buttons": True, "no_buttons": True},
+                {},
+            ]
+            errs: list[str] = []
+            sent = False
+            for flags in ladder:
+                t_, k_, lp_ = render({**o, **flags}, role, bc_id)
+                try:
+                    m = await bot.send_message(
+                        chat_id, t_, reply_markup=k_, link_preview_options=lp_,
+                        business_connection_id=bc_id,
+                    )
+                except TelegramAPIError as e:
+                    errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
+                    log.warning("resend failed (status %s, variant %s): %s", o["status"], flags or "full", e)
+                    continue
                 o["msgs"][role] = (chat_id, m.message_id, bc_id)
+                log.info("resend ok (status %s, variant %s)", o["status"], flags or "full")
                 try:
                     await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message_id])
                 except TelegramAPIError as e:
                     log.info("can't delete old offer message: %s", e)
+                sent = True
+                break
+            if sent:
                 continue
-            except TelegramAPIError as e:
-                log.warning("resend failed (%s), editing instead", e)
+            log.warning("resend failed in all variants, editing instead")
+            try:
+                await bot.send_message(
+                    o["buyer_id"],
+                    f"⚠️ Не смог отправить новое сообщение по шагу сделки «{escape(o['status'])}» в чат — "
+                    "правлю старое (собеседник может не увидеть).\n"
+                    + "\n".join(f"<code>{escape(x)}</code>" for x in errs[:4]),
+                )
+            except TelegramAPIError:
+                pass
 
         try:
             if chat_id is None:  # сообщение, отправленное через inline
