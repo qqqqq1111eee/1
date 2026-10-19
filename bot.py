@@ -23,6 +23,7 @@ from aiogram.types import (
 )
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("offer_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
@@ -31,18 +32,21 @@ dp = Dispatcher()
 # offer_id -> dict. Пока в памяти; потом заменить на SQLite/Postgres.
 OFFERS: dict[str, dict] = {}
 
+# Статусы оффера:
+# pending -> accepted -> seller_confirmed -> done
+#         \-> declined / expired
+
 
 # ---------- ОПЛАТА (сюда подключаешь свою логику) ----------
 
 async def reserve_payment(o: dict) -> bool:
     """Вызывается, когда продавец нажал «Принять».
-    Здесь должна быть проверка/заморозка средств покупателя.
-    Верни True, если деньги зарезервированы, иначе False."""
+    Здесь проверка/заморозка средств покупателя. True — деньги зарезервированы."""
     return True  # TODO
 
 
 async def release_payment(o: dict) -> None:
-    """Вызывается, когда продавец подтвердил передачу подарка.
+    """Вызывается, когда покупатель подтвердил получение подарка.
     Здесь выплата продавцу."""
     return None  # TODO
 
@@ -51,7 +55,7 @@ async def release_payment(o: dict) -> None:
 
 def gift_title(url: str) -> str:
     """https://t.me/nft/MirageLamp-71292 -> Mirage Lamp #71292"""
-    slug = url.rstrip("/").split("/")[-1]
+    slug = url.split("?")[0].rstrip("/").split("/")[-1]
     if "-" in slug:
         name, num = slug.rsplit("-", 1)
         name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)
@@ -61,7 +65,7 @@ def gift_title(url: str) -> str:
 
 def money(o: dict) -> str:
     if o["currency"] == "stars":
-        return f"{o['price']} ⭐"
+        return f"{o['price']} ★"
     return f"{o['price']:,} Gram"
 
 
@@ -69,8 +73,8 @@ def cur_name(o: dict) -> str:
     return "Stars" if o["currency"] == "stars" else "Gram"
 
 
-def user_link(uid: int, name: str) -> str:
-    return f'<a href="tg://user?id={uid}">{escape(name)}</a>'
+def user_link(uid: int, text: str) -> str:
+    return f'<a href="tg://user?id={uid}">{escape(text)}</a>'
 
 
 def gift_link(o: dict) -> str:
@@ -83,7 +87,7 @@ def time_left(o: dict) -> tuple[int, int]:
 
 
 def preview_on(o: dict) -> LinkPreviewOptions:
-    # карточка подарка (Telegram / Mirage Lamp #71292 + картинка + «ПОКАЗАТЬ ПОДАРОК»)
+    # карточка подарка: Telegram / Mirage Lamp #71292 + картинка + «ПОКАЗАТЬ ПОДАРОК»
     return LinkPreviewOptions(url=o["url"], prefer_large_media=True)
 
 
@@ -101,7 +105,7 @@ def parse_query(text: str) -> dict | None:
             link = tok
         elif low in {"gram", "грам", "грамм", "ton", "тон"}:
             currency = "gram"
-        elif low in {"stars", "star", "зв", "звезд", "звезды", "⭐"}:
+        elif low in {"stars", "star", "зв", "звезд", "звезды", "⭐", "★"}:
             currency = "stars"
         elif re.fullmatch(r"\d[\d,_]*", tok):
             nums.append(int(re.sub(r"[,_]", "", tok)))
@@ -118,11 +122,11 @@ def pending_view(o: dict):
     h, m = time_left(o)
     text = (
         f"🎁 Пользователь предлагает Вам {money(o)} за подарок {gift_link(o)}.\n\n"
-        f"⏱ Предложение действует ещё {h} ч. {m} мин."
+        f"🕒 Предложение действует ещё {h} ч. {m} мин."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"acc:{o['id']}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"dec:{o['id']}"),
+        InlineKeyboardButton(text="✓ Принять", callback_data=f"acc:{o['id']}"),
+        InlineKeyboardButton(text="✕ Отклонить", callback_data=f"dec:{o['id']}"),
     ]])
     return text, kb, preview_on(o)
 
@@ -134,27 +138,38 @@ def accepted_view(o: dict):
         f"для зачисления {cur_name(o)}."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        # открывает страницу подарка, где нужно нажать «Передать» и выбрать покупателя
+        # открывает страницу подарка: там «Передать» и выбор покупателя
         [InlineKeyboardButton(text="Передать", url=o["url"])],
-        [InlineKeyboardButton(text="✅ Я передал подарок", callback_data=f"ok:{o['id']}")],
+        [InlineKeyboardButton(text="✓ Подтвердить передачу", callback_data=f"sc:{o['id']}")],
+    ])
+    return text, kb, preview_on(o)
+
+
+def seller_confirmed_view(o: dict):
+    text = (
+        f"🎁 Подарок: {gift_link(o)} передан продавцом.\n\n"
+        f"• {user_link(o['buyer_id'], 'Покупатель')}, подтвердите получение подарка."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✓ Подтвердить получение", callback_data=f"bc:{o['id']}")],
     ])
     return text, kb, preview_on(o)
 
 
 def done_view(o: dict):
     text = (
-        f"✅ NFT {gift_link(o)} успешно передан!\n\n"
-        f"Средства будут зачислены в течение 30 минут."
+        f"🎁 NFT {gift_link(o)} успешно передан!\n\n"
+        f"• Средства будут зачислены в течение 30 минут."
     )
     return text, None, preview_on(o)
 
 
 def declined_view(o: dict):
-    return f"🚫 Сделка отклонена.\n\nПодарок: {gift_link(o)}", None, PREVIEW_OFF
+    return f"🎁 Сделка отклонена.\n\nПодарок: {gift_link(o)}", None, PREVIEW_OFF
 
 
 def expired_view(o: dict):
-    return f"⌛ Срок предложения истёк.\n\nПодарок: {gift_link(o)}", None, PREVIEW_OFF
+    return f"🎁 Срок предложения истёк.\n\nПодарок: {gift_link(o)}", None, PREVIEW_OFF
 
 
 async def render(cb: CallbackQuery, view):
@@ -168,7 +183,7 @@ async def render(cb: CallbackQuery, view):
         )
     except TelegramBadRequest as e:
         if "not modified" not in str(e):
-            raise
+            log.warning("edit failed: %s", e)
 
 
 # ---------- handlers ----------
@@ -183,7 +198,7 @@ async def start(msg: Message):
         "• <b>1500</b> — цена\n"
         "• ссылка — подарок\n"
         "• <b>60</b> — время действия в минутах (по умолчанию 60)\n"
-        "• добавь слово <code>gram</code>, если цена в Gram (по умолчанию ⭐ Stars)",
+        "• добавь слово <code>gram</code>, если цена в Gram (по умолчанию ★ Stars)",
         link_preview_options=PREVIEW_OFF,
     )
 
@@ -282,13 +297,27 @@ async def on_decline(cb: CallbackQuery):
     await cb.answer("Сделка отклонена.")
 
 
-@dp.callback_query(F.data.startswith("ok:"))
-async def on_confirm(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("sc:"))
+async def on_seller_confirm(cb: CallbackQuery):
+    """Продавец: «Подтвердить передачу»."""
     o = get_offer(cb)
     if not o or o["status"] != "accepted":
         return await cb.answer("Недоступно.", show_alert=True)
     if cb.from_user.id != o["seller_id"]:
-        return await cb.answer("Подтвердить может только продавец.", show_alert=True)
+        return await cb.answer("Подтвердить передачу может только продавец.", show_alert=True)
+    o["status"] = "seller_confirmed"
+    await render(cb, seller_confirmed_view(o))
+    await cb.answer("Ждём подтверждения покупателя.")
+
+
+@dp.callback_query(F.data.startswith("bc:"))
+async def on_buyer_confirm(cb: CallbackQuery):
+    """Покупатель: «Подтвердить получение» -> финал."""
+    o = get_offer(cb)
+    if not o or o["status"] != "seller_confirmed":
+        return await cb.answer("Недоступно.", show_alert=True)
+    if cb.from_user.id != o["buyer_id"]:
+        return await cb.answer("Подтвердить получение может только покупатель.", show_alert=True)
     o["status"] = "done"
     await release_payment(o)
     await render(cb, done_view(o))
