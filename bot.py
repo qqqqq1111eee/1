@@ -37,6 +37,11 @@ ALSO_DM = os.getenv("OFFER_DM", "0") == "1"
 # После каждого шага сделки слать в бизнес-чат новое сообщение вместо правки старого (OFFER_RESEND=0 — только правки).
 RESEND = os.getenv("OFFER_RESEND", "1") == "1"
 
+# OFFER_DEEPLINK=1 — кнопки в бизнес-чате становятся ссылками на бота (t.me/бот?start=...).
+# По умолчанию выключено: кнопки «Принять/Отклонить» обычные и нажимаются прямо в чате.
+DEEPLINK = os.getenv("OFFER_DEEPLINK", "0") == "1"
+BOT_USERNAME = ""  # заполняется при старте
+
 dp = Dispatcher()
 
 # Пока всё в памяти; потом заменить на SQLite/Postgres.
@@ -138,6 +143,26 @@ TEXT_HINTS = {
 }
 
 
+_ACTION_RE = re.compile(r"^(acc|dec|cx|sc|bc):(\w+)$")
+
+
+def deeplink_kb(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
+    if not kb or not BOT_USERNAME:
+        return kb
+    rows = []
+    for row in kb.inline_keyboard:
+        new_row = []
+        for b in row:
+            m = _ACTION_RE.match(b.callback_data or "")
+            if m:
+                b = InlineKeyboardButton(
+                    text=b.text, url=f"https://t.me/{BOT_USERNAME}?start={m.group(1)}_{m.group(2)}"
+                )
+            new_row.append(b)
+        rows.append(new_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def render(o: dict, role: str, bc_id: str | None = None):
     """view_for + для бизнес-чатов: без кнопок, с подсказкой что писать словами."""
     text, kb, lp = view_for(o, role)
@@ -155,6 +180,8 @@ def render(o: dict, role: str, bc_id: str | None = None):
         lp = None  # без параметров: Telegram сам подтянет карточку по ссылке на подарок в тексте
     if o.get("no_preview"):
         lp = PREVIEW_OFF
+    if bc_id and DEEPLINK:
+        kb = deeplink_kb(kb)
     if bc_id and (not BUTTONS or o.get("no_buttons")):
         kb = None
         hint = TEXT_HINTS.get(o["status"])
@@ -341,9 +368,24 @@ async def send_view(bot: Bot, chat_id: int, view, bc_id: str | None = None) -> i
 
 # ---------- handlers ----------
 
+@dp.update.outer_middleware()
+async def log_updates(handler, event, data):
+    try:
+        kinds = [k for k in event.model_fields_set if k != "update_id"]
+        log.info("update %s: %s", getattr(event, "update_id", "?"), kinds)
+    except Exception:  # noqa: BLE001
+        pass
+    return await handler(event, data)
+
+
 @dp.message(CommandStart())
-async def start(msg: Message, bot: Bot):
+async def start(msg: Message, command: CommandObject, bot: Bot):
     remember(msg.from_user)
+    m = re.fullmatch(r"(acc|dec|cx|sc|bc)_(\w+)", command.args or "")
+    if m and msg.from_user:
+        log.info("deeplink %s from user %s", command.args, msg.from_user.id)
+        text, _ = await do_action(bot, m.group(1), m.group(2), msg.from_user)
+        return await msg.answer(text, link_preview_options=PREVIEW_OFF)
     await msg.answer(await help_text(bot), link_preview_options=PREVIEW_OFF)
 
 
@@ -637,12 +679,15 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель.
     #    Если Telegram отвечает PEER_FLOOD, пробуем всё более простые варианты текста.
     attempts = [
+        {"strip_links": True},
         {},
         {"strip_links": True, "raw_url": True},
         {"strip_links": True, "raw_url": True, "no_preview": True},
         {"strip_links": True, "raw_url": True, "no_buttons": True},
         {"strip_links": True, "raw_url": True, "no_buttons": True, "no_preview": True},
     ]
+    errs: list[str] = []
+    used: dict = {}
     for flags in attempts:
         for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview", "raw_url", "no_buttons"):
             o.pop(k_, None)
@@ -651,10 +696,22 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         try:
             mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
             log.info("offer: sent as a new business message (variant %s)", flags or "full")
+            used = flags
             break
         except TelegramAPIError as e:
             err = e
+            errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
             log.warning("business send failed (variant %s): %s: %s", flags or "full", type(e).__name__, e)
+
+    if mid is not None and errs:
+        try:
+            await bot.send_message(
+                msg.from_user.id,
+                f"ℹ️ Оффер ушёл упрощённым вариантом {escape(str(used or 'full'))}. Ошибки предыдущих попыток:\n"
+                + "\n".join(f"<code>{escape(x)}</code>" for x in errs[:5]),
+            )
+        except TelegramAPIError:
+            pass
 
     # 2) запасной вариант: заменить ваше сообщение (получатель такую правку может не увидеть)
     if mid is None:
@@ -722,97 +779,95 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             log.warning("can't delete command message (нет права «Удаление сообщений» у бота в Telegram Business?): %s", e)
 
 
-def get_offer(cb: CallbackQuery) -> dict | None:
-    log.info("callback %s from user %s", cb.data, cb.from_user.id)
-    o = OFFERS.get(cb.data.split(":", 1)[1])
+async def do_action(bot: Bot, action: str, oid: str, u: User) -> tuple[str, bool]:
+    """Единая логика шагов сделки. Вызывается и из callback-кнопок, и из ссылок t.me/бот?start=...
+    Возвращает (текст ответа, показывать ли как alert)."""
+    o = OFFERS.get(oid)
+    if not o:
+        return "Оффер не найден (бот перезапускался).", True
+    st = o["status"]
+    if action == "acc":
+        if st != "pending":
+            return "Оффер уже обработан.", False
+        if o["expires"] <= time.time():
+            o["status"] = "expired"
+            await refresh(bot, o)
+            return "Срок истёк.", False
+        if u.id == o["buyer_id"]:
+            return "Нельзя принять собственный оффер.", True
+        if o["target_id"] and u.id != o["target_id"]:
+            return "Этот оффер адресован другому пользователю.", True
+        o["status"] = "processing"  # защита от двойного нажатия
+        if not await reserve_payment(o):
+            o["status"] = "pending"
+            return "Не удалось зарезервировать оплату.", True
+        o["status"] = "accepted"
+        o["seller_id"] = u.id
+        o["seller_name"] = u.full_name
+        await refresh(bot, o)
+        return "Сделка принята! Передайте подарок покупателю и подтвердите передачу.", False
+    if action == "dec":
+        if st != "pending":
+            return "Оффер уже обработан.", False
+        if o["target_id"] and u.id not in (o["target_id"], o["buyer_id"]):
+            return "Этот оффер адресован другому пользователю.", True
+        o["status"] = "declined"
+        await refresh(bot, o)
+        return "Сделка отклонена.", False
+    if action == "cx":
+        if st != "pending":
+            return "Недоступно.", True
+        if u.id != o["buyer_id"]:
+            return "Отменить может только автор оффера.", True
+        o["status"] = "declined"
+        await refresh(bot, o)
+        return "Оффер отменён.", False
+    if action == "sc":
+        if st != "accepted":
+            return "Недоступно.", True
+        if u.id != o["seller_id"]:
+            return "Подтвердить передачу может только продавец.", True
+        o["status"] = "seller_confirmed"
+        await refresh(bot, o)
+        return "Ждём подтверждения покупателя.", False
+    if action == "bc":
+        if st != "seller_confirmed":
+            return "Недоступно.", True
+        if u.id != o["buyer_id"]:
+            return "Подтвердить получение может только покупатель.", True
+        o["status"] = "done"
+        await release_payment(o)
+        await refresh(bot, o)
+        return "Готово!", False
+    return "Неизвестное действие.", True
+
+
+@dp.callback_query(F.data.regexp(r"^(acc|dec|cx|sc|bc):"))
+async def on_action(cb: CallbackQuery):
+    action, oid = cb.data.split(":", 1)
+    log.info("callback %s from user %s (inline=%s, msg=%s)", cb.data, cb.from_user.id,
+             bool(cb.inline_message_id), getattr(cb.message, "message_id", None))
+    o = OFFERS.get(oid)
     if o and cb.inline_message_id and "shared" not in o["msgs"]:
         o["msgs"]["shared"] = (None, cb.inline_message_id, None)
-    return o
-
-
-@dp.callback_query(F.data.startswith("acc:"))
-async def on_accept(cb: CallbackQuery):
-    o = get_offer(cb)
-    if not o:
-        return await cb.answer("Оффер не найден (бот перезапускался).", show_alert=True)
-    if o["status"] != "pending":
-        return await cb.answer("Оффер уже обработан.")
-    if o["expires"] <= time.time():
-        o["status"] = "expired"
-        await refresh(cb.bot, o)
-        return await cb.answer("Срок истёк.")
-    if cb.from_user.id == o["buyer_id"]:
-        return await cb.answer("Нельзя принять собственный оффер.", show_alert=True)
-    if o["target_id"] and cb.from_user.id != o["target_id"]:
-        return await cb.answer("Этот оффер адресован другому пользователю.", show_alert=True)
-    o["status"] = "processing"  # защита от двойного нажатия
-    if not await reserve_payment(o):
-        o["status"] = "pending"
-        return await cb.answer("Не удалось зарезервировать оплату.", show_alert=True)
-    o["status"] = "accepted"
-    o["seller_id"] = cb.from_user.id
-    o["seller_name"] = cb.from_user.full_name
-    await refresh(cb.bot, o)
-    await cb.answer("Сделка принята!")
-
-
-@dp.callback_query(F.data.startswith("dec:"))
-async def on_decline(cb: CallbackQuery):
-    o = get_offer(cb)
-    if not o:
-        return await cb.answer("Оффер не найден.", show_alert=True)
-    if o["status"] != "pending":
-        return await cb.answer("Оффер уже обработан.")
-    if o["target_id"] and cb.from_user.id not in (o["target_id"], o["buyer_id"]):
-        return await cb.answer("Этот оффер адресован другому пользователю.", show_alert=True)
-    o["status"] = "declined"
-    await refresh(cb.bot, o)
-    await cb.answer("Сделка отклонена.")
-
-
-@dp.callback_query(F.data.startswith("cx:"))
-async def on_cancel(cb: CallbackQuery):
-    o = get_offer(cb)
-    if not o or o["status"] != "pending":
-        return await cb.answer("Недоступно.", show_alert=True)
-    if cb.from_user.id != o["buyer_id"]:
-        return await cb.answer("Отменить может только автор оффера.", show_alert=True)
-    o["status"] = "declined"
-    await refresh(cb.bot, o)
-    await cb.answer("Оффер отменён.")
-
-
-@dp.callback_query(F.data.startswith("sc:"))
-async def on_seller_confirm(cb: CallbackQuery):
-    """Продавец: «Подтвердить передачу»."""
-    o = get_offer(cb)
-    if not o or o["status"] != "accepted":
-        return await cb.answer("Недоступно.", show_alert=True)
-    if cb.from_user.id != o["seller_id"]:
-        return await cb.answer("Подтвердить передачу может только продавец.", show_alert=True)
-    o["status"] = "seller_confirmed"
-    await refresh(cb.bot, o)
-    await cb.answer("Ждём подтверждения покупателя.")
-
-
-@dp.callback_query(F.data.startswith("bc:"))
-async def on_buyer_confirm(cb: CallbackQuery):
-    """Покупатель: «Подтвердить получение» -> финал."""
-    o = get_offer(cb)
-    if not o or o["status"] != "seller_confirmed":
-        return await cb.answer("Недоступно.", show_alert=True)
-    if cb.from_user.id != o["buyer_id"]:
-        return await cb.answer("Подтвердить получение может только покупатель.", show_alert=True)
-    o["status"] = "done"
-    await release_payment(o)
-    await refresh(cb.bot, o)
-    await cb.answer("Готово!")
+    text, alert = "Что-то пошло не так, попробуйте ещё раз.", True
+    try:
+        text, alert = await do_action(cb.bot, action, oid, cb.from_user)
+    except Exception:  # noqa: BLE001
+        log.exception("do_action failed")
+    try:
+        await cb.answer(text, show_alert=alert)
+    except TelegramAPIError as e:
+        log.info("callback answer failed: %s", e)
 
 
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("Задай переменную окружения BOT_TOKEN")
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global BOT_USERNAME
+    BOT_USERNAME = (await bot.me()).username or ""
+    log.info("bot username: %s, deeplink buttons: %s", BOT_USERNAME, DEEPLINK)
     await dp.start_polling(
         bot,
         allowed_updates=[
