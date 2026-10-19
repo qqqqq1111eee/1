@@ -441,8 +441,13 @@ async def biz_text(msg: Message, bot: Bot):
     log.info("business_message chat=%s from=%s owner=%s text=%r", msg.chat.id, msg.from_user.id, is_owner, text[:60])
 
     # владелец создаёт оффер: «@бот ссылка 700 120»
-    if is_owner and text.lower().startswith(prefix):
-        return await business_offer(msg, text[len(prefix):].strip(), bot, bc_id)
+    # имя бота сверяем терпимо: цифра 0, латинская o и русская о считаются одним символом
+    def _norm(t: str) -> str:
+        return t.lower().replace("o", "0").replace("о", "0")
+
+    first = text.split(None, 1)[0] if text else ""
+    if is_owner and first.startswith("@") and _norm(first) == _norm(prefix):
+        return await business_offer(msg, text[len(first):].strip(), bot, bc_id)
 
     # ответы словами в чате с активным оффером
     o = active_offer(msg.chat.id, bc_id)
