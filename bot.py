@@ -144,11 +144,16 @@ def render(o: dict, role: str, bc_id: str | None = None):
         text = re.sub(r'<a href="tg://user\?id=\d+">(.*?)</a>', r"\1", text)
     if o.get("simple_preview") and not lp.is_disabled:
         lp = LinkPreviewOptions(url=o["url"])
+    if o.get("raw_url"):
+        # ссылка на подарок видна целиком, а не спрятана за словами
+        text = re.sub(r'<a href="(https?://t\.me/nft/[^"]+)">(.*?)</a>', r"\2\n\1", text)
+        if not lp.is_disabled:
+            lp = None
     if o.get("auto_preview") and not lp.is_disabled:
         lp = None  # без параметров: Telegram сам подтянет карточку по ссылке на подарок в тексте
     if o.get("no_preview"):
         lp = PREVIEW_OFF
-    if bc_id and not BUTTONS:
+    if bc_id and (not BUTTONS or o.get("no_buttons")):
         kb = None
         hint = TEXT_HINTS.get(o["status"])
         if hint:
@@ -527,6 +532,11 @@ async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> N
         ("1. обычный текст", "Тест 1: обычный текст", None),
         ("2. текст со ссылкой на подарок", "Тест 2: https://t.me/nft/MirageLamp-71292", None),
         ("3. текст с кнопкой", "Тест 3: с кнопкой", kb),
+        ("4. спрятанная ссылка (слова вместо адреса)", 'Тест 4: <a href="https://t.me/nft/MirageLamp-71292">Mirage Lamp #71292</a>', None),
+        ("5. две кнопки", "Тест 5: две кнопки", InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✓ Принять", callback_data="noop:1"),
+            InlineKeyboardButton(text="✕ Отклонить", callback_data="noop:2"),
+        ]])),
     ]
     results = []
     for name, t, k in variants:
@@ -600,13 +610,13 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     #    Если Telegram отвечает PEER_FLOOD, пробуем всё более простые варианты текста.
     attempts = [
         {},
-        {"strip_links": True},
-        {"strip_links": True, "auto_preview": True},
-        {"strip_links": True, "simple_preview": True},
-        {"strip_links": True, "no_preview": True},
+        {"strip_links": True, "raw_url": True},
+        {"strip_links": True, "raw_url": True, "no_preview": True},
+        {"strip_links": True, "raw_url": True, "no_buttons": True},
+        {"strip_links": True, "raw_url": True, "no_buttons": True, "no_preview": True},
     ]
     for flags in attempts:
-        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview"):
+        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview", "raw_url", "no_buttons"):
             o.pop(k_, None)
         o.update(flags)
         text, kb, lp = render(o, "shared", bc_id)
