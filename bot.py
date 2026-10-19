@@ -169,6 +169,9 @@ def render(o: dict, role: str, bc_id: str | None = None):
     # запасные упрощения для бизнес-отправки (включаются, если Telegram отвечает PEER_FLOOD)
     if o.get("strip_links"):
         text = re.sub(r'<a href="tg://user\?id=\d+">(.*?)</a>', r"\1", text)
+    if o.get("no_timer"):
+        # диагностика показала: ссылка на подарок + строка про срок в одном сообщении → PEER_FLOOD
+        text = re.sub(r"\n\n🕒[^\n]*$", "", text)
     if o.get("simple_preview") and not lp.is_disabled:
         lp = LinkPreviewOptions(url=o["url"])
     if o.get("raw_url"):
@@ -705,17 +708,18 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель.
     #    Если Telegram отвечает PEER_FLOOD, пробуем всё более простые варианты текста.
     attempts = [
+        {"strip_links": True, "no_timer": True},
+        {"strip_links": True, "no_timer": True, "no_preview": True},
+        {"strip_links": True, "no_timer": True, "raw_url": True},
+        {"strip_links": True, "no_timer": True, "no_buttons": True},
+        {"strip_links": True, "no_timer": True, "no_buttons": True, "no_preview": True},
         {"strip_links": True},
         {},
-        {"strip_links": True, "raw_url": True},
-        {"strip_links": True, "raw_url": True, "no_preview": True},
-        {"strip_links": True, "raw_url": True, "no_buttons": True},
-        {"strip_links": True, "raw_url": True, "no_buttons": True, "no_preview": True},
     ]
     errs: list[str] = []
     used: dict = {}
     for flags in attempts:
-        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview", "raw_url", "no_buttons"):
+        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview", "raw_url", "no_buttons", "no_timer"):
             o.pop(k_, None)
         o.update(flags)
         text, kb, lp = render(o, "shared", bc_id)
@@ -727,12 +731,6 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         except TelegramAPIError as e:
             err = e
             errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
-            if "PEER_FLOOD" in str(e):
-                # Telegram режет ЛЮБОЕ новое сообщение в этот чат — упрощать текст бесполезно,
-                # а повторные попытки только ухудшают лимиты. Сразу переходим к правке.
-                log.warning("PEER_FLOOD: новые сообщения в чат %s запрещены, остальные варианты пропущены", msg.chat.id)
-                break
-            log.warning("business send failed (variant %s): %s: %s", flags or "full", type(e).__name__, e)
 
     if mid is not None and errs:
         try:
