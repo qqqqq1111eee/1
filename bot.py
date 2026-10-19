@@ -617,13 +617,17 @@ async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> N
                 delete_error = f"{type(e).__name__}: {e}"
         except TelegramAPIError as e:
             results.append(f"❌ {name}: {type(e).__name__}: {e}")
+            if "PEER_FLOOD" in str(e) and name.startswith("1."):
+                results.append("⛔ Даже обычный текст без ссылок и кнопок блокируется — дело не в содержимом, "
+                               "остальные тесты пропущены (чтобы не копить лимиты).")
+                break
         await asyncio.sleep(1)
     if delete_error:
         results.append(
             "⚠️ Удалить тестовые сообщения не удалось (" + delete_error + "). "
             "Включи боту право «Удаление сообщений» в Настройки → Telegram для бизнеса → Чат-боты."
         )
-    report = "🧪 Результат теста отправки от вашего имени:\n" + "\n".join(results)
+    report = f"🧪 Результат теста отправки от вашего имени (чат {msg.chat.id}):\n" + "\n".join(results)
     log.info(report.replace("\n", " | "))
     try:
         await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
