@@ -601,6 +601,28 @@ async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> N
     t7, k7, lp7 = render(fake, "shared", bc_id)
     variants.append(("7. оффер без ссылки на профиль", t7, k7, lp7))
 
+    # 8-16: «деление пополам» — чем настоящий оффер отличается от тестов 1-5, которые проходят
+    G = "https://t.me/nft/MirageLamp-71292"
+    GL = f'<a href="{G}">Mirage Lamp #71292</a>'
+    offer_plain = "Пользователь предлагает Вам 1500 ★ за подарок Mirage Lamp #71292."
+    offer_hidden = f"Пользователь предлагает Вам 1500 ★ за подарок {GL}."
+    timer = "\n\n🕒 Предложение действует ещё 0 ч. 59 мин."
+    kb2 = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✓ Принять", callback_data="acc:selftest"),
+        InlineKeyboardButton(text="✕ Отклонить", callback_data="dec:selftest"),
+    ]])
+    variants += [
+        ("8. только эмодзи 🎁", "🎁 Тест", None),
+        ("9. цена со звездой: 1500 ★", "Тест: 1500 ★", None),
+        ("10. текст оффера, без эмодзи и ссылки", offer_plain, None),
+        ("11. то же + строка про срок (🕒), без ссылки", offer_plain + timer, None),
+        ("12. 🎁 + текст оффера, без ссылки", "🎁 " + offer_plain, None),
+        ("13. 🎁 + текст оффера + скрытая ссылка на подарок", "🎁 " + offer_hidden, None),
+        ("14. полный текст оффера, превью выкл, без кнопок", "🎁 " + offer_hidden + timer, None),
+        ("15. полный текст оффера, превью выкл, 2 кнопки", "🎁 " + offer_hidden + timer, kb2),
+        ("16. полный текст оффера, большая карточка подарка, без кнопок", "🎁 " + offer_hidden + timer, None, preview_on(fake)),
+    ]
+
     results = []
     delete_error = None
     for name, t, k, *rest in variants:
