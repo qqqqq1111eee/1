@@ -28,9 +28,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("offer_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-# В бизнес-чатах по умолчанию без кнопок (Telegram может помечать такие сообщения «via @бот»).
-# OFFER_BUTTONS=1 вернёт кнопки и в бизнес-чатах.
-BUTTONS = os.getenv("OFFER_BUTTONS", "0") == "1"
+# Кнопки под оффером в бизнес-чатах. Если Telegram пометит такие сообщения «via @бот»,
+# поставь на Railway OFFER_BUTTONS=0 — тогда останутся только ответы словами.
+BUTTONS = os.getenv("OFFER_BUTTONS", "1") == "1"
 
 dp = Dispatcher()
 
