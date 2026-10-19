@@ -137,6 +137,13 @@ TEXT_HINTS = {
 def render(o: dict, role: str, bc_id: str | None = None):
     """view_for + для бизнес-чатов: без кнопок, с подсказкой что писать словами."""
     text, kb, lp = view_for(o, role)
+    # запасные упрощения для бизнес-отправки (включаются, если Telegram отвечает PEER_FLOOD)
+    if o.get("strip_links"):
+        text = re.sub(r'<a href="tg://user\?id=\d+">(.*?)</a>', r"\1", text)
+    if o.get("simple_preview") and not lp.is_disabled:
+        lp = LinkPreviewOptions(url=o["url"])
+    if o.get("no_preview"):
+        lp = PREVIEW_OFF
     if bc_id and not BUTTONS:
         kb = None
         hint = TEXT_HINTS.get(o["status"])
@@ -567,13 +574,26 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
     mid, edited, err = None, False, None
     text, kb, lp = render(o, "shared", bc_id)
 
-    # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель
-    try:
-        mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
-        log.info("offer: sent as a new business message")
-    except (TelegramForbiddenError, TelegramBadRequest) as e:
-        err = e
-        log.warning("business send failed: %s", e)
+    # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель.
+    #    Если Telegram отвечает PEER_FLOOD, пробуем всё более простые варианты текста.
+    attempts = [
+        {},
+        {"strip_links": True},
+        {"strip_links": True, "simple_preview": True},
+        {"strip_links": True, "no_preview": True},
+    ]
+    for flags in attempts:
+        for k_ in ("strip_links", "simple_preview", "no_preview"):
+            o.pop(k_, None)
+        o.update(flags)
+        text, kb, lp = render(o, "shared", bc_id)
+        try:
+            mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
+            log.info("offer: sent as a new business message (variant %s)", flags or "full")
+            break
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            err = e
+            log.warning("business send failed (variant %s): %s", flags or "full", e)
 
     # 2) запасной вариант: заменить ваше сообщение (получатель такую правку может не увидеть)
     if mid is None:
