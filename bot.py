@@ -16,6 +16,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
@@ -26,6 +28,9 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("offer_bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+# В бизнес-чатах по умолчанию без кнопок (Telegram может помечать такие сообщения «via @бот»).
+# OFFER_BUTTONS=1 вернёт кнопки и в бизнес-чатах.
+BUTTONS = os.getenv("OFFER_BUTTONS", "0") == "1"
 
 dp = Dispatcher()
 
@@ -61,7 +66,12 @@ HELP = (
     "• <b>1500</b> — цена\n"
     "• ссылка — подарок\n"
     "• <b>60</b> — время действия в минутах (по умолчанию 60)\n"
-    "• добавь слово <code>gram</code>, если цена в Gram (по умолчанию ★ Stars)"
+    "• добавь слово <code>gram</code>, если цена в Gram (по умолчанию ★ Stars)\n\n"
+    "<b>Дальше в чате словами:</b>\n"
+    "• получатель: «принять» или «отклонить»\n"
+    "• получатель после передачи: «передал»\n"
+    "• ты после получения: «получил»\n"
+    "• отменить оффер: «отмена»"
 )
 
 
@@ -114,6 +124,23 @@ def preview_on(o: dict) -> LinkPreviewOptions:
 
 
 PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
+
+TEXT_HINTS = {
+    "pending": "✍️ Получатель, ответьте в чат: «принять» или «отклонить».",
+    "accepted": "✍️ Продавец, передайте подарок и напишите «передал».",
+    "seller_confirmed": "✍️ Покупатель, подтвердите получение — напишите «получил».",
+}
+
+
+def render(o: dict, role: str, bc_id: str | None = None):
+    """view_for + для бизнес-чатов: без кнопок, с подсказкой что писать словами."""
+    text, kb, lp = view_for(o, role)
+    if bc_id and not BUTTONS:
+        kb = None
+        hint = TEXT_HINTS.get(o["status"])
+        if hint:
+            text += "\n\n" + hint
+    return text, kb, lp
 
 
 def parse_query(text: str) -> dict | None:
@@ -242,13 +269,19 @@ def view_for(o: dict, role: str):
 async def refresh(bot: Bot, o: dict) -> None:
     """Обновляет все сообщения оффера (у получателя и у покупателя)."""
     for role, (chat_id, message_id, bc_id) in o["msgs"].items():
-        text, kb, lp = view_for(o, role)
+        text, kb, lp = render(o, role, bc_id)
         try:
-            await bot.edit_message_text(
-                text=text, chat_id=chat_id, message_id=message_id,
-                reply_markup=kb, link_preview_options=lp,
-                business_connection_id=bc_id,
-            )
+            if chat_id is None:  # сообщение, отправленное через inline
+                await bot.edit_message_text(
+                    text=text, inline_message_id=message_id,
+                    reply_markup=kb, link_preview_options=lp,
+                )
+            else:
+                await bot.edit_message_text(
+                    text=text, chat_id=chat_id, message_id=message_id,
+                    reply_markup=kb, link_preview_options=lp,
+                    business_connection_id=bc_id,
+                )
         except TelegramBadRequest as e:
             if "not modified" not in str(e):
                 log.warning("edit failed (%s): %s", role, e)
@@ -367,31 +400,81 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
 
 @dp.inline_query()
 async def on_inline(q: InlineQuery):
-    """Если в BotFather включён Inline Mode, клиент ждёт ответа на «@бот ...».
-    Отвечаем сразу пустым списком — тогда сообщение уходит как обычный текст,
-    а его подхватывает business-обработчик ниже."""
+    """Inline-офферов больше нет (они дают «via @бот»). Отвечаем пустым списком,
+    чтобы «@бот ...» уходило обычным текстом и его подхватил business-обработчик."""
     try:
         await q.answer([], cache_time=0, is_personal=True)
     except TelegramBadRequest as e:
         log.info("inline answer failed: %s", e)
 
 
+ACCEPT = {"принять", "принимаю", "приняла", "accept", "ok", "ок", "да"}
+DECLINE = {"отклонить", "отклоняю", "нет", "отказ", "decline"}
+CANCEL = {"отмена", "отменить", "cancel"}
+SELLER_DONE = {"передал", "передала", "передано", "отправил", "отправила"}
+BUYER_DONE = {"получил", "получила", "получено", "получен"}
+LIVE = {"pending", "accepted", "seller_confirmed"}
+
+
+def active_offer(chat_id: int, bc_id: str) -> dict | None:
+    cands = [
+        o for o in OFFERS.values()
+        if o["status"] in LIVE
+        and o["msgs"].get("shared", (None, None, None))[0] == chat_id
+        and o["msgs"]["shared"][2] == bc_id
+    ]
+    return max(cands, key=lambda o: o["expires"]) if cands else None
+
+
 @dp.business_message(F.text)
-async def biz_mention(msg: Message, bot: Bot):
-    """Владелец пишет в любом личном чате «@бот 1500 ссылка 60» — бот заменяет это оффером от его имени."""
+async def biz_text(msg: Message, bot: Bot):
     bc_id = msg.business_connection_id
+    if not bc_id or not msg.from_user:
+        return
+    owner = await business_owner(bot, bc_id)
+    if owner is None:
+        return
     me = await bot.me()
     text = (msg.text or "").strip()
     prefix = "@" + (me.username or "").lower()
-    log.info("business_message chat=%s from=%s text=%r", msg.chat.id, msg.from_user and msg.from_user.id, text[:60])
-    if not bc_id or not text.lower().startswith(prefix):
-        log.info("skip: text doesn't start with %s", prefix)
+    is_owner = msg.from_user.id == owner
+    log.info("business_message chat=%s from=%s owner=%s text=%r", msg.chat.id, msg.from_user.id, is_owner, text[:60])
+
+    # владелец создаёт оффер: «@бот ссылка 700 120»
+    if is_owner and text.lower().startswith(prefix):
+        return await business_offer(msg, text[len(prefix):].strip(), bot, bc_id)
+
+    # ответы словами в чате с активным оффером
+    o = active_offer(msg.chat.id, bc_id)
+    if not o:
         return
-    owner = await business_owner(bot, bc_id)
-    if owner is None or not msg.from_user or msg.from_user.id != owner:
-        log.info("skip: sender %s is not owner %s", msg.from_user and msg.from_user.id, owner)
+    word = re.sub(r"[^\w]", "", text.lower())
+    st = o["status"]
+    if st == "pending":
+        if o["expires"] <= time.time():
+            o["status"] = "expired"
+        elif word in CANCEL and is_owner:
+            o["status"] = "declined"
+        elif word in DECLINE and not is_owner:
+            o["status"] = "declined"
+        elif word in ACCEPT and not is_owner and msg.from_user.id == o["target_id"]:
+            o["status"] = "processing"
+            if not await reserve_payment(o):
+                o["status"] = "pending"
+                return
+            o["status"] = "accepted"
+            o["seller_id"] = msg.from_user.id
+            o["seller_name"] = msg.from_user.full_name
+        else:
+            return
+    elif st == "accepted" and word in SELLER_DONE and not is_owner and msg.from_user.id == o["seller_id"]:
+        o["status"] = "seller_confirmed"
+    elif st == "seller_confirmed" and word in BUYER_DONE and is_owner:
+        o["status"] = "done"
+        await release_payment(o)
+    else:
         return
-    await business_offer(msg, text[len(prefix):].strip(), bot, bc_id)
+    await refresh(bot, o)
 
 
 async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
@@ -417,7 +500,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         "msgs": {},
     }
     try:
-        mid = await send_view(bot, msg.chat.id, view_for(o, "shared"), bc_id)
+        mid = await send_view(bot, msg.chat.id, render(o, "shared", bc_id), bc_id)
     except (TelegramForbiddenError, TelegramBadRequest) as e:
         log.warning("business send failed: %s", e)
         # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
@@ -441,7 +524,10 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
 
 
 def get_offer(cb: CallbackQuery) -> dict | None:
-    return OFFERS.get(cb.data.split(":", 1)[1])
+    o = OFFERS.get(cb.data.split(":", 1)[1])
+    if o and cb.inline_message_id and "shared" not in o["msgs"]:
+        o["msgs"]["shared"] = (None, cb.inline_message_id, None)
+    return o
 
 
 @dp.callback_query(F.data.startswith("acc:"))
