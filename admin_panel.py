@@ -541,9 +541,6 @@ async def show_status(bot: Bot, chat_id: int) -> None:
     stat_line = " · ".join(f"{STATUS.get(k, ('•',))[0]} {v}" for k, v in by_status.items()) or "—"
     done_line = " · ".join(escape(fmt_money({"currency": c, "price": v})) for c, v in totals.items()) or "—"
 
-    hooks = st.get("hooks") or {}
-    pay_lines = [f"{'✅ подключено' if ok else '▫️ заглушка'} — <code>{escape(name)}</code>"
-                 for name, ok in hooks.items()] or ["▫️ bot_payments.py не найден — всё работает как заглушка"]
     flags = st.get("flags") or {}
     flag_lines = [f"{'✅' if v is True else '▫️' if v is False else '•'} {escape(str(k))}"
                   f"{'' if isinstance(v, bool) else ': ' + escape(str(v))}" for k, v in flags.items()]
@@ -551,7 +548,6 @@ async def show_status(bot: Bot, chat_id: int) -> None:
     text = (
         "🩺 <b>Статус бота</b>\n\n"
         f"{mode_line()}\n\n"
-        "💳 <b>Оплата</b> (bot_payments.py)\n" + "\n".join(pay_lines) + "\n\n"
         f"📦 <b>Офферы</b>: всего {len(offers)}\nПо статусам: {stat_line}\nЗавершено на сумму: {done_line}\n\n"
         "📡 <b>Доставка в Business-чаты</b> (обход PEER_FLOOD)\n" + counters_text() + "\n\n"
         "⚙️ <b>Настройки бота</b>\n" + ("\n".join(flag_lines) or "• не переданы")
