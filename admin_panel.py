@@ -378,7 +378,7 @@ def mode_line() -> str:
         return "Режим: ❔ не задан (бот не передал статус)"
     if st["live"]:
         return "Режим: 🟢 <b>боевой</b> — оплата подключена"
-    return "Режим: 🧪 <b>бета</b> — оплата не подключена, офферы только между разрешёнными"
+    return "Режим: 🧪 <b>бета</b> — оплата не подключена, офферы можно слать любому получателю"
 
 
 async def notify_admin(bot: Bot, text: str, user_id: int | None = None, offer_id: str | None = None) -> None:

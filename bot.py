@@ -90,9 +90,8 @@ def gate_offer(buyer_id: int, target_id: int | None) -> str | None:
         hint = "" if ADMIN_ID else "\n(Админ ещё не задан: на Railway добавь переменную ADMIN_ID.)"
         return (f"🔒 Бот приватный. Твой ID: <code>{buyer_id}</code> — отправь его администратору, "
                 f"чтобы получить доступ.{hint}")
-    if not PAYMENTS_LIVE and (target_id is None or not is_allowed(target_id)):
-        return ("🧪 Бета-режим: оплата ещё не подключена, поэтому офферы можно слать только участникам теста. "
-                f"ID получателя: <code>{target_id}</code> — админ может добавить его командой /allow.")
+    # Ограничение «офферы только между разрешёнными» в бета-режиме убрано:
+    # получателем может быть любой пользователь.
     return None
 
 
