@@ -189,7 +189,7 @@ def gift_title(url: str) -> str:
 
 def money(o: dict) -> str:
     if o["currency"] == "stars":
-        return f"{o['price']} ★"
+        return f"{o['price']} ⭐"
     p = o["price"]
     return f"{p:,.2f}".rstrip("0").rstrip(".") + " Gram" if isinstance(p, float) else f"{p:,} Gram"
 
@@ -225,7 +225,7 @@ TEXT_HINTS = {
 }
 
 
-_ACTION_RE = re.compile(r"^(acc|dec|cx|sc|bc):(\w+)$")
+_ACTION_RE = re.compile(r"^(acc|dec|cx|sc|bc|how):(\w+)$")
 
 
 def deeplink_kb(kb: InlineKeyboardMarkup | None) -> InlineKeyboardMarkup | None:
@@ -316,15 +316,13 @@ def parse_query(text: str) -> dict | None:
 # role: "seller" (получатель оффера), "buyer" (кто кинул оффер), "shared" (общий чат)
 
 def pending_view(o: dict):
-    h, m = time_left(o)
-    text = (
-        f"🎁 {user_link(o['buyer_id'], 'Пользователь')} предлагает Вам {money(o)} "
-        f"за подарок {gift_link(o)}.\n\n"
-        f"🕒 Предложение действует ещё {h} ч. {m} мин."
-    )
+    # как в Telegram: «Пользователь <имя> предлагает Вам 200 ⭐ за подарок <подарок>.»
+    name = o.get("buyer_name")
+    who = f"Пользователь <b>{escape(name)}</b>" if name else "Пользователь"
+    text = f"{who} предлагает Вам {money(o)} за подарок {gift_link(o)}."
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✓ Принять", callback_data=f"acc:{o['id']}"),
         InlineKeyboardButton(text="✕ Отклонить", callback_data=f"dec:{o['id']}"),
+        InlineKeyboardButton(text="✓ Принять", callback_data=f"acc:{o['id']}"),
     ]])
     return text, kb, preview_on(o)
 
@@ -343,14 +341,15 @@ def buyer_wait_view(o: dict):
 
 
 def accepted_view(o: dict):
+    cur = "звёзд" if o["currency"] == "stars" else "Gram"
     text = (
         f"🎁 Подарок: {gift_link(o)} успешно продан!\n\n"
-        f"• Передайте подарок {user_link(o['buyer_id'], 'покупателю')} "
-        f"для зачисления {cur_name(o)}."
+        f"<b>Передайте подарок покупателю для зачисления {cur}.</b>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         # открывает страницу подарка: там «Передать» и выбор покупателя
-        [InlineKeyboardButton(text="Передать", url=o["url"])],
+        [InlineKeyboardButton(text="Передать NFT", url=o["url"])],
+        [InlineKeyboardButton(text="Как передать?", callback_data=f"how:{o['id']}")],
         [InlineKeyboardButton(text="✓ Подтвердить передачу", callback_data=f"sc:{o['id']}")],
     ])
     return text, kb, preview_on(o)
@@ -517,7 +516,7 @@ async def log_updates(handler, event, data):
 @dp.message(CommandStart())
 async def start(msg: Message, command: CommandObject, bot: Bot):
     remember(msg.from_user)
-    m = re.fullmatch(r"(acc|dec|cx|sc|bc)_(\w+)", command.args or "")
+    m = re.fullmatch(r"(acc|dec|cx|sc|bc|how)_(\w+)", command.args or "")
     if m and msg.from_user:
         log.info("deeplink %s from user %s", command.args, msg.from_user.id)
         text, _ = await do_action(bot, m.group(1), m.group(2), msg.from_user)
@@ -615,6 +614,7 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
         "id": uuid.uuid4().hex[:10],
         "created": time.time(),
         "buyer_id": msg.from_user.id,
+        "buyer_name": msg.from_user.full_name,
         "target_id": target_id,
         "target_name": target_name,
         "url": data["url"],
@@ -866,6 +866,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         "id": uuid.uuid4().hex[:10],
         "created": time.time(),
         "buyer_id": msg.from_user.id,
+        "buyer_name": msg.from_user.full_name,
         "target_id": msg.chat.id,
         "target_name": msg.chat.full_name,
         "url": data["url"],
@@ -1011,6 +1012,9 @@ async def do_action(bot: Bot, action: str, oid: str, u: User) -> tuple[str, bool
     if not o:
         return "Оффер не найден (бот перезапускался).", True
     st = o["status"]
+    if action == "how":
+        return ("Нажмите «Передать NFT», выберите покупателя и отправьте подарок. "
+                "Затем нажмите «Подтвердить передачу».", True)
     if action == "acc":
         if st != "pending":
             return "Оффер уже обработан.", False
@@ -1067,7 +1071,7 @@ async def do_action(bot: Bot, action: str, oid: str, u: User) -> tuple[str, bool
     return "Неизвестное действие.", True
 
 
-@dp.callback_query(F.data.regexp(r"^(acc|dec|cx|sc|bc):"))
+@dp.callback_query(F.data.regexp(r"^(acc|dec|cx|sc|bc|how):"))
 async def on_action(cb: CallbackQuery):
     action, oid = cb.data.split(":", 1)
     log.info("callback %s from user %s (inline=%s, msg=%s)", cb.data, cb.from_user.id,
