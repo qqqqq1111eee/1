@@ -534,4 +534,414 @@ async def on_inline(q: InlineQuery):
 
 ACCEPT = {"принять", "принимаю", "приняла", "accept", "ok", "ок", "да"}
 DECLINE = {"отклонить", "отклоняю", "нет", "отказ", "decline"}
-CANCEL = {"отмена", "отме
+CANCEL = {"отмена", "отменить", "cancel"}
+SELLER_DONE = {"передал", "передала", "передано", "отправил", "отправила"}
+BUYER_DONE = {"получил", "получила", "получено", "получен"}
+LIVE = {"pending", "accepted", "seller_confirmed"}
+
+
+def active_offer(chat_id: int, bc_id: str) -> dict | None:
+    cands = [
+        o for o in OFFERS.values()
+        if o["status"] in LIVE
+        and o["msgs"].get("shared", (None, None, None))[0] == chat_id
+        and o["msgs"]["shared"][2] == bc_id
+    ]
+    return max(cands, key=lambda o: o["expires"]) if cands else None
+
+
+@dp.business_message(F.text)
+async def biz_text(msg: Message, bot: Bot):
+    bc_id = msg.business_connection_id
+    if not bc_id or not msg.from_user:
+        return
+    owner = await business_owner(bot, bc_id)
+    if owner is None:
+        return
+    me = await bot.me()
+    text = (msg.text or "").strip()
+    prefix = "@" + (me.username or "").lower()
+    is_owner = msg.from_user.id == owner
+    log.info("business_message chat=%s from=%s owner=%s text=%r", msg.chat.id, msg.from_user.id, is_owner, text[:60])
+
+    # диагностика: владелец пишет /bottest в чате — бот пробует 3 вида сообщений и сообщает результат
+    if is_owner and text.lower() in {"/bottest", "/тест"} and msg.chat.id != owner:
+        return await business_selftest(msg, bot, bc_id, owner)
+
+    # владелец создаёт оффер: «@бот ссылка 700 120»
+    # имя бота сверяем терпимо: цифра 0, латинская o и русская о считаются одним символом
+    def _norm(t: str) -> str:
+        return t.lower().replace("o", "0").replace("о", "0")
+
+    first = text.split(None, 1)[0] if text else ""
+    if is_owner and first.startswith("@") and _norm(first) == _norm(prefix):
+        return await business_offer(msg, text[len(first):].strip(), bot, bc_id)
+
+    # ответы словами в чате с активным оффером
+    o = active_offer(msg.chat.id, bc_id)
+    if not o:
+        return
+    word = re.sub(r"[^\w]", "", text.lower())
+    st = o["status"]
+    if st == "pending":
+        if o["expires"] <= time.time():
+            o["status"] = "expired"
+        elif word in CANCEL and is_owner:
+            o["status"] = "declined"
+        elif word in DECLINE and not is_owner:
+            o["status"] = "declined"
+        elif word in ACCEPT and not is_owner and msg.from_user.id == o["target_id"]:
+            o["status"] = "processing"
+            if not await reserve_payment(o):
+                o["status"] = "pending"
+                return
+            o["status"] = "accepted"
+            o["seller_id"] = msg.from_user.id
+            o["seller_name"] = msg.from_user.full_name
+        else:
+            return
+    elif st == "accepted" and word in SELLER_DONE and not is_owner and msg.from_user.id == o["seller_id"]:
+        o["status"] = "seller_confirmed"
+    elif st == "seller_confirmed" and word in BUYER_DONE and is_owner:
+        o["status"] = "done"
+        await release_payment(o)
+    else:
+        return
+    await refresh(bot, o)
+
+
+_TASKS: set = set()
+
+
+async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> None:
+    """Проверяет, какие сообщения Telegram разрешает слать от вашего имени (чтобы понять причину PEER_FLOOD)."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✓ Тест", callback_data="noop:0")]])
+    variants = [
+        ("1. обычный текст", "Тест 1: обычный текст", None),
+        ("2. текст со ссылкой на подарок", "Тест 2: https://t.me/nft/MirageLamp-71292", None),
+        ("3. текст с кнопкой", "Тест 3: с кнопкой", kb),
+        ("4. спрятанная ссылка (слова вместо адреса)", 'Тест 4: <a href="https://t.me/nft/MirageLamp-71292">Mirage Lamp #71292</a>', None),
+        ("5. две кнопки", "Тест 5: две кнопки", InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✓ Принять", callback_data="noop:1"),
+            InlineKeyboardButton(text="✕ Отклонить", callback_data="noop:2"),
+        ]])),
+    ]
+    # 6-7: настоящий оффер — тот же render(), те же preview и tg://user-ссылка, что и в бою
+    fake = {
+        "id": "selftest", "buyer_id": owner, "target_id": msg.chat.id,
+        "target_name": msg.chat.full_name, "url": "https://t.me/nft/MirageLamp-71292",
+        "title": "Mirage Lamp #71292", "price": 1500, "currency": "stars",
+        "expires": time.time() + 3600, "status": "pending",
+        "seller_id": None, "seller_name": None, "msgs": {},
+    }
+    t6, k6, lp6 = render(fake, "shared", bc_id)
+    variants.append(("6. НАСТОЯЩИЙ оффер (как в бою: ссылка на профиль + карточка подарка + кнопки)", t6, k6, lp6))
+    fake["strip_links"] = True
+    t7, k7, lp7 = render(fake, "shared", bc_id)
+    variants.append(("7. оффер без ссылки на профиль", t7, k7, lp7))
+
+    # 8-16: «деление пополам» — чем настоящий оффер отличается от тестов 1-5, которые проходят
+    G = "https://t.me/nft/MirageLamp-71292"
+    GL = f'<a href="{G}">Mirage Lamp #71292</a>'
+    offer_plain = "Пользователь предлагает Вам 1500 ★ за подарок Mirage Lamp #71292."
+    offer_hidden = f"Пользователь предлагает Вам 1500 ★ за подарок {GL}."
+    timer = "\n\n🕒 Предложение действует ещё 0 ч. 59 мин."
+    kb2 = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✓ Принять", callback_data="acc:selftest"),
+        InlineKeyboardButton(text="✕ Отклонить", callback_data="dec:selftest"),
+    ]])
+    variants += [
+        ("8. только эмодзи 🎁", "🎁 Тест", None),
+        ("9. цена со звездой: 1500 ★", "Тест: 1500 ★", None),
+        ("10. текст оффера, без эмодзи и ссылки", offer_plain, None),
+        ("11. то же + строка про срок (🕒), без ссылки", offer_plain + timer, None),
+        ("12. 🎁 + текст оффера, без ссылки", "🎁 " + offer_plain, None),
+        ("13. 🎁 + текст оффера + скрытая ссылка на подарок", "🎁 " + offer_hidden, None),
+        ("14. полный текст оффера, превью выкл, без кнопок", "🎁 " + offer_hidden + timer, None),
+        ("15. полный текст оффера, превью выкл, 2 кнопки", "🎁 " + offer_hidden + timer, kb2),
+        ("16. полный текст оффера, большая карточка подарка, без кнопок", "🎁 " + offer_hidden + timer, None, preview_on(fake)),
+    ]
+
+    results = []
+    delete_error = None
+    for name, t, k, *rest in variants:
+        lp = rest[0] if rest else PREVIEW_OFF
+        try:
+            m = await bot.send_message(
+                msg.chat.id, t, reply_markup=k, business_connection_id=bc_id,
+                link_preview_options=lp,
+            )
+            results.append(f"✅ {name}")
+            try:
+                await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[m.message_id])
+            except TelegramAPIError as e:
+                delete_error = f"{type(e).__name__}: {e}"
+        except TelegramAPIError as e:
+            results.append(f"❌ {name}: {type(e).__name__}: {e}")
+            if "PEER_FLOOD" in str(e) and name.startswith("1."):
+                results.append("⛔ Даже обычный текст без ссылок и кнопок блокируется — дело не в содержимом, "
+                               "остальные тесты пропущены (чтобы не копить лимиты).")
+                break
+        await asyncio.sleep(1)
+    if delete_error:
+        results.append(
+            "⚠️ Удалить тестовые сообщения не удалось (" + delete_error + "). "
+            "Включи боту право «Удаление сообщений» в Настройки → Telegram для бизнеса → Чат-боты."
+        )
+    report = f"🧪 Результат теста отправки от вашего имени (чат {msg.chat.id}):\n" + "\n".join(results)
+    log.info(report.replace("\n", " | "))
+    try:
+        await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
+    except TelegramAPIError:
+        pass
+    try:
+        await bot.send_message(owner, escape(report))
+    except TelegramAPIError:
+        pass
+
+async def _second_edit(bot: Bot, o: dict) -> None:
+    for delay in (2.0, 5.0):  # на всякий случай два раза
+        await asyncio.sleep(delay)
+        text, kb, lp = render(o, "shared", o["msgs"]["shared"][2])
+        try:
+            await bot.edit_message_text(
+                text=text + ("" if delay == 2.0 else "\u200b"),  # чередуем, чтобы правка отличалась от предыдущей
+                chat_id=o["msgs"]["shared"][0], message_id=o["msgs"]["shared"][1],
+                business_connection_id=o["msgs"]["shared"][2],
+                reply_markup=kb, link_preview_options=lp,
+            )
+            log.info("second edit done (delay %s)", delay)
+        except TelegramBadRequest as e:
+            log.info("second edit failed: %s", e)
+
+
+async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
+    """Оффер от имени владельца аккаунта (без «via @bot»)."""
+    data = parse_query(args)
+    if not data or msg.chat.type != "private" or msg.chat.id == msg.from_user.id:
+        log.info("skip offer: parse=%s chat_type=%s self_chat=%s", bool(data), msg.chat.type, msg.chat.id == msg.from_user.id)
+        return  # молча игнорируем, чтобы не светить ошибки собеседнику
+
+    o = {
+        "id": uuid.uuid4().hex[:10],
+        "buyer_id": msg.from_user.id,
+        "target_id": msg.chat.id,
+        "target_name": msg.chat.full_name,
+        "url": data["url"],
+        "title": gift_title(data["url"]),
+        "price": data["price"],
+        "currency": data["currency"],
+        "expires": time.time() + data["minutes"] * 60,
+        "status": "pending",
+        "seller_id": None,
+        "seller_name": None,
+        "msgs": {},
+    }
+    mid, edited, err = None, False, None
+    text, kb, lp = render(o, "shared", bc_id)
+
+    # 1) отправляем НОВОЕ сообщение от вашего имени — его увидит получатель.
+    #    Если Telegram отвечает PEER_FLOOD, пробуем всё более простые варианты текста.
+    attempts = [
+        {"strip_links": True, "alt_timer": True},
+        {"strip_links": True, "no_timer": True},
+        {"strip_links": True, "no_timer": True, "no_preview": True},
+        {"strip_links": True, "no_timer": True, "raw_url": True},
+        {"strip_links": True, "no_timer": True, "no_buttons": True},
+        {"strip_links": True, "no_timer": True, "no_buttons": True, "no_preview": True},
+        {"strip_links": True},
+        {},
+    ]
+    errs: list[str] = []
+    used: dict = {}
+    for flags in attempts:
+        for k_ in ("strip_links", "simple_preview", "auto_preview", "no_preview", "raw_url", "no_buttons", "no_timer", "alt_timer"):
+            o.pop(k_, None)
+        o.update(flags)
+        text, kb, lp = render(o, "shared", bc_id)
+        try:
+            mid = await send_view(bot, msg.chat.id, (text, kb, lp), bc_id)
+            log.info("offer: sent as a new business message (variant %s)", flags or "full")
+            used = flags
+            break
+        except TelegramAPIError as e:
+            err = e
+            errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
+
+    if mid is not None and errs and used.get("no_buttons"):
+        try:
+            await bot.send_message(
+                msg.from_user.id,
+                f"ℹ️ Оффер ушёл упрощённым вариантом {escape(str(used or 'full'))}. Ошибки предыдущих попыток:\n"
+                + "\n".join(f"<code>{escape(x)}</code>" for x in errs[:5]),
+            )
+        except TelegramAPIError:
+            pass
+
+    # 2) запасной вариант: заменить ваше сообщение (получатель такую правку может не увидеть)
+    if mid is None:
+        try:
+            await bot.edit_message_text(
+                text=text + "\u200b",
+                chat_id=msg.chat.id, message_id=msg.message_id,
+                business_connection_id=bc_id, reply_markup=kb, link_preview_options=lp,
+            )
+            mid, edited = msg.message_id, True
+            log.info("offer: edited the owner's message in place (fallback)")
+            # новое сообщение отправить не удалось — сообщаем владельцу почему (получатель в этом режиме часто ничего не видит)
+            try:
+                await bot.send_message(
+                    msg.from_user.id,
+                    "⚠️ Новое сообщение с оффером Telegram не принял, поэтому я отредактировал твоё сообщение "
+                    "(в этом режиме получатель может не увидеть оффер).\n"
+                    f"Причина: <code>{escape(type(err).__name__ + ': ' + str(err))}</code>",
+                )
+            except TelegramAPIError:
+                pass
+        except TelegramAPIError as e:
+            log.warning("edit in place failed: %s", e)
+
+    if mid is None:
+        # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
+        try:
+            await bot.send_message(
+                msg.from_user.id,
+                f"⚠️ Не удалось отправить оффер в чат с {escape(msg.chat.full_name or str(msg.chat.id))}:\n"
+                f"<code>{escape(str(err))}</code>",
+            )
+        except TelegramAPIError:
+            pass
+        return
+    o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
+    OFFERS[o["id"]] = o
+
+    # Первая правка чужого сообщения доходит только до владельца, вторая — до получателя.
+    # Поэтому через пару секунд правим ещё раз (убираем невидимый символ).
+    if edited:
+        t = asyncio.create_task(_second_edit(bot, o))
+        _TASKS.add(t)
+        t.add_done_callback(_TASKS.discard)
+
+    # запасной канал: дублируем оффер получателю в личку с ботом (нужно, чтобы он хоть раз нажал /start)
+    if ALSO_DM:
+        try:
+            o["msgs"]["seller"] = (msg.chat.id, await send_view(bot, msg.chat.id, view_for(o, "seller")), None)
+        except TelegramAPIError as e:
+            log.info("dm to recipient failed: %s", e)
+            try:
+                await bot.send_message(
+                    msg.from_user.id,
+                    "ℹ️ Получатель пока не видит кнопки в личке с ботом: ему нужно один раз нажать /start у бота.",
+                )
+            except TelegramAPIError:
+                pass
+
+    # убираем исходную команду из чата (нужно право на удаление сообщений), если не редактировали её
+    if not edited:
+        try:
+            await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[msg.message_id])
+        except TelegramAPIError as e:
+            log.warning("can't delete command message (нет права «Удаление сообщений» у бота в Telegram Business?): %s", e)
+
+
+async def do_action(bot: Bot, action: str, oid: str, u: User) -> tuple[str, bool]:
+    """Единая логика шагов сделки. Вызывается и из callback-кнопок, и из ссылок t.me/бот?start=...
+    Возвращает (текст ответа, показывать ли как alert)."""
+    o = OFFERS.get(oid)
+    if not o:
+        return "Оффер не найден (бот перезапускался).", True
+    st = o["status"]
+    if action == "acc":
+        if st != "pending":
+            return "Оффер уже обработан.", False
+        if o["expires"] <= time.time():
+            o["status"] = "expired"
+            await refresh(bot, o)
+            return "Срок истёк.", False
+        if u.id == o["buyer_id"]:
+            return "Нельзя принять собственный оффер.", True
+        if o["target_id"] and u.id != o["target_id"]:
+            return "Этот оффер адресован другому пользователю.", True
+        o["status"] = "processing"  # защита от двойного нажатия
+        if not await reserve_payment(o):
+            o["status"] = "pending"
+            return "Не удалось зарезервировать оплату.", True
+        o["status"] = "accepted"
+        o["seller_id"] = u.id
+        o["seller_name"] = u.full_name
+        await refresh(bot, o)
+        return "Сделка принята! Передайте подарок покупателю и подтвердите передачу.", False
+    if action == "dec":
+        if st != "pending":
+            return "Оффер уже обработан.", False
+        if o["target_id"] and u.id not in (o["target_id"], o["buyer_id"]):
+            return "Этот оффер адресован другому пользователю.", True
+        o["status"] = "declined"
+        await refresh(bot, o)
+        return "Сделка отклонена.", False
+    if action == "cx":
+        if st != "pending":
+            return "Недоступно.", True
+        if u.id != o["buyer_id"]:
+            return "Отменить может только автор оффера.", True
+        o["status"] = "declined"
+        await refresh(bot, o)
+        return "Оффер отменён.", False
+    if action == "sc":
+        if st != "accepted":
+            return "Недоступно.", True
+        if u.id != o["seller_id"]:
+            return "Подтвердить передачу может только продавец.", True
+        o["status"] = "seller_confirmed"
+        await refresh(bot, o)
+        return "Ждём подтверждения покупателя.", False
+    if action == "bc":
+        if st != "seller_confirmed":
+            return "Недоступно.", True
+        if u.id != o["buyer_id"]:
+            return "Подтвердить получение может только покупатель.", True
+        o["status"] = "done"
+        await release_payment(o)
+        await refresh(bot, o)
+        return "Готово!", False
+    return "Неизвестное действие.", True
+
+
+@dp.callback_query(F.data.regexp(r"^(acc|dec|cx|sc|bc):"))
+async def on_action(cb: CallbackQuery):
+    action, oid = cb.data.split(":", 1)
+    log.info("callback %s from user %s (inline=%s, msg=%s)", cb.data, cb.from_user.id,
+             bool(cb.inline_message_id), getattr(cb.message, "message_id", None))
+    o = OFFERS.get(oid)
+    if o and cb.inline_message_id and "shared" not in o["msgs"]:
+        o["msgs"]["shared"] = (None, cb.inline_message_id, None)
+    text, alert = "Что-то пошло не так, попробуйте ещё раз.", True
+    try:
+        text, alert = await do_action(cb.bot, action, oid, cb.from_user)
+    except Exception:  # noqa: BLE001
+        log.exception("do_action failed")
+    try:
+        await cb.answer(text, show_alert=alert)
+    except TelegramAPIError as e:
+        log.info("callback answer failed: %s", e)
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Задай переменную окружения BOT_TOKEN")
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global BOT_USERNAME
+    BOT_USERNAME = (await bot.me()).username or ""
+    log.info("bot username: %s, deeplink buttons: %s", BOT_USERNAME, DEEPLINK)
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message", "callback_query", "inline_query",
+            "business_connection", "business_message",
+            "edited_business_message", "deleted_business_messages",
+        ],
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
