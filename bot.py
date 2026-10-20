@@ -24,6 +24,22 @@ from aiogram.types import (
     User,
 )
 
+from admin_panel import (
+    ADMIN_ID,
+    STATE_FILE,
+    attach_bot,
+    bump,
+    is_admin,
+    is_allowed,
+    log_event,
+    notify_admin,
+    record_offer,
+    set_business,
+    setup_admin,
+    track,
+    who,
+)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("offer_bot")
 
@@ -43,28 +59,95 @@ DEEPLINK = os.getenv("OFFER_DEEPLINK", "0") == "1"
 BOT_USERNAME = ""  # заполняется при старте
 
 dp = Dispatcher()
+setup_admin(dp)  # админ-панель: /admin /offers /business /status /users /log /allow /revoke
 
 # Пока всё в памяти; потом заменить на SQLite/Postgres.
 OFFERS: dict[str, dict] = {}
 USERS: dict[str, int] = {}  # username (lower) -> user_id, заполняется по /start и /offer
 BUSINESS: dict[str, int] = {}  # business_connection_id -> user_id владельца аккаунта
 
+# ---------- ПРИВАТНОСТЬ ----------
+# ADMIN_ID — твой Telegram ID (админ-панель /admin). ALLOWED_IDS — ID разрешённых пользователей через запятую.
+# Бот приватный: оффер может отправить только админ и те, кто в списке (/allow и /revoke тоже работают,
+# но хранятся в памяти — после перезапуска Railway остаётся только то, что записано в ALLOWED_IDS).
+# Всё про доступ (ADMIN_ID, ALLOWED, is_admin, is_allowed, профили) живёт в admin_panel.py.
+# Оплата живёт в отдельном файле bot_payments.py (его пишешь ты). Пока файла нет или в нём LIVE = False,
+# бот работает в бета-режиме: офферы можно слать только тем, кто тоже в списке разрешённых.
+# Как только в bot_payments.py стоит LIVE = True, это ограничение снимается автоматически.
+try:
+    import bot_payments as payments
+except ImportError:
+    payments = None
+PAYMENTS_LIVE = bool(getattr(payments, "LIVE", False))
+if payments is not None and getattr(payments, "router", None) is not None:
+    dp.include_router(payments.router)  # хэндлеры оплаты (pre_checkout, successful_payment и т.д.)
+_NOTIFIED: set[int] = set()
+
+
+def gate_offer(buyer_id: int, target_id: int | None) -> str | None:
+    """None — можно слать оффер; иначе текст отказа для отправителя."""
+    if not is_allowed(buyer_id):
+        hint = "" if ADMIN_ID else "\n(Админ ещё не задан: на Railway добавь переменную ADMIN_ID.)"
+        return (f"🔒 Бот приватный. Твой ID: <code>{buyer_id}</code> — отправь его администратору, "
+                f"чтобы получить доступ.{hint}")
+    if not PAYMENTS_LIVE and (target_id is None or not is_allowed(target_id)):
+        return ("🧪 Бета-режим: оплата ещё не подключена, поэтому офферы можно слать только участникам теста. "
+                f"ID получателя: <code>{target_id}</code> — админ может добавить его командой /allow.")
+    return None
+
+
 # Статусы: pending -> accepted -> seller_confirmed -> done
 #          \-> declined / expired
 
 
-# ---------- ОПЛАТА (сюда подключаешь свою логику) ----------
+# ---------- ОПЛАТА (вся логика — в bot_payments.py) ----------
+
+async def check_offer(o: dict) -> str | None:
+    """Перед отправкой оффера. None — можно слать; текст — показать владельцу и не слать
+    (например «не хватает звёзд» / «оплата не прошла»). Реализуй bot_payments.check_offer."""
+    fn = getattr(payments, "check_offer", None)
+    if fn is None:
+        return None
+    try:
+        return await fn(o)
+    except Exception:  # noqa: BLE001
+        log.exception("bot_payments.check_offer failed")
+        return "Ошибка оплаты, попробуй позже."
+
 
 async def reserve_payment(o: dict) -> bool:
-    """Вызывается, когда продавец нажал «Принять».
-    Здесь проверка/заморозка средств покупателя. True — деньги зарезервированы."""
-    return True  # TODO
+    """Вызывается, когда получатель нажал «Принять». True — деньги зарезервированы."""
+    fn = getattr(payments, "reserve_payment", None)
+    if fn is None:
+        return True  # без bot_payments — заглушка (бета)
+    try:
+        return bool(await fn(o))
+    except Exception:  # noqa: BLE001
+        log.exception("bot_payments.reserve_payment failed")
+        return False
 
 
 async def release_payment(o: dict) -> None:
-    """Вызывается, когда покупатель подтвердил получение подарка.
-    Здесь выплата продавцу."""
-    return None  # TODO
+    """Вызывается, когда покупатель подтвердил получение подарка (выплата продавцу)."""
+    fn = getattr(payments, "release_payment", None)
+    if fn is None:
+        return None
+    try:
+        await fn(o)
+    except Exception:  # noqa: BLE001
+        log.exception("bot_payments.release_payment failed")
+        o["payout_error"] = True
+
+
+async def refund_payment(o: dict) -> None:
+    """Вызывается один раз, когда оффер отклонён, отменён или истёк (вернуть удержанное)."""
+    fn = getattr(payments, "refund_payment", None)
+    if fn is None:
+        return None
+    try:
+        await fn(o)
+    except Exception:  # noqa: BLE001
+        log.exception("bot_payments.refund_payment failed")
 
 
 # ---------- helpers ----------
@@ -333,6 +416,17 @@ def view_for(o: dict, role: str):
 
 async def refresh(bot: Bot, o: dict) -> None:
     """Обновляет все сообщения оффера (у получателя и у покупателя)."""
+    if o["status"] in ("declined", "expired") and not o.get("_refunded"):
+        o["_refunded"] = True
+        await refund_payment(o)
+    record_offer(o)
+    if o.get("_logged") != o["status"]:
+        o["_logged"] = o["status"]
+        log_event(f"оффер {o['id']} → {o['status']}")
+        if o["status"] == "done" and not o.get("_notified"):
+            o["_notified"] = True
+            await notify_admin(bot, f"✅ Сделка завершена: {escape(o['title'])} · {escape(money(o))}",
+                               offer_id=o["id"])
     for role, (chat_id, message_id, bc_id) in list(o["msgs"].items()):
         text, kb, lp = render(o, role, bc_id)
 
@@ -357,9 +451,12 @@ async def refresh(bot: Bot, o: dict) -> None:
                 except TelegramAPIError as e:
                     errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
                     log.warning("resend failed (status %s, variant %s): %s", o["status"], flags or "full", e)
+                    if "PEER_FLOOD" in str(e):
+                        bump("peer_flood")
                     continue
                 o["msgs"][role] = (chat_id, m.message_id, bc_id)
                 log.info("resend ok (status %s, variant %s)", o["status"], flags or "full")
+                bump("resend_ok")
                 try:
                     await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message_id])
                 except TelegramAPIError as e:
@@ -369,6 +466,7 @@ async def refresh(bot: Bot, o: dict) -> None:
             if sent:
                 continue
             log.warning("resend failed in all variants, editing instead")
+            bump("resend_failed")
             try:
                 await bot.send_message(
                     o["buyer_id"],
@@ -425,16 +523,32 @@ async def start(msg: Message, command: CommandObject, bot: Bot):
         log.info("deeplink %s from user %s", command.args, msg.from_user.id)
         text, _ = await do_action(bot, m.group(1), m.group(2), msg.from_user)
         return await msg.answer(text, link_preview_options=PREVIEW_OFF)
-    await msg.answer(await help_text(bot), link_preview_options=PREVIEW_OFF)
+    track(msg.from_user)
+    if not is_allowed(msg.from_user.id if msg.from_user else None):
+        uid = msg.from_user.id if msg.from_user else 0
+        hint = "" if ADMIN_ID else "\n(Админ ещё не задан: на Railway добавь переменную ADMIN_ID.)"
+        return await msg.answer(
+            f"🔒 Бот приватный. Твой ID: <code>{uid}</code> — отправь его администратору, чтобы получить доступ.{hint}"
+        )
+    extra = "\n\n🛠 Админ-панель: /admin" if is_admin(msg.from_user.id) else ""
+    await msg.answer(await help_text(bot) + extra, link_preview_options=PREVIEW_OFF)
 
 
 @dp.business_connection()
-async def on_business_connection(bc: BusinessConnection):
+async def on_business_connection(bc: BusinessConnection, bot: Bot):
     if bc.is_enabled:
         BUSINESS[bc.id] = bc.user.id
+        set_business(bc.user, True, bc.id)
         log.info("business connected: %s (user %s)", bc.id, bc.user.id)
+        await notify_admin(
+            bot,
+            f"🔔 Новое подключение: {who(bc.user.id)}\n"
+            + ("✅ в списке разрешённых" if is_allowed(bc.user.id) else "⛔ НЕ в списке разрешённых"),
+            user_id=bc.user.id,
+        )
     else:
         BUSINESS.pop(bc.id, None)
+        set_business(bc.user, False)
         log.info("business disconnected: %s", bc.id)
 
 
@@ -461,6 +575,7 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
         return await business_offer(msg, command.args or "", bot, bc_id)
 
     remember(msg.from_user)
+    track(msg.from_user)
     args = command.args or ""
     data = parse_query(args)
     if not data:
@@ -480,6 +595,10 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
 
     if target_id == msg.from_user.id:
         return await msg.answer("Нельзя кинуть оффер самому себе.")
+    refusal = gate_offer(msg.from_user.id, target_id)
+    if refusal:
+        bump("gate_blocked")
+        return await msg.answer(refusal)
 
     private = msg.chat.type == "private"
     if private and not target_id:
@@ -495,6 +614,7 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
 
     o = {
         "id": uuid.uuid4().hex[:10],
+        "created": time.time(),
         "buyer_id": msg.from_user.id,
         "target_id": target_id,
         "target_name": target_name,
@@ -508,6 +628,9 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
         "seller_name": None,
         "msgs": {},
     }
+    problem = await check_offer(o)
+    if problem:
+        return await msg.answer(problem)
 
     try:
         if private:
@@ -520,6 +643,8 @@ async def cmd_offer(msg: Message, command: CommandObject, bot: Bot):
         return await msg.answer("Не получилось отправить оффер: получатель должен нажать /start у бота.")
 
     OFFERS[o["id"]] = o
+    record_offer(o)
+    log_event(f"оффер {o['id']} создан (личный чат): {msg.from_user.id} → {target_id}, {o['title']}, {money(o)}")
 
 
 @dp.inline_query()
@@ -699,6 +824,7 @@ async def business_selftest(msg: Message, bot: Bot, bc_id: str, owner: int) -> N
     except TelegramAPIError:
         pass
 
+
 async def _second_edit(bot: Bot, o: dict) -> None:
     for delay in (2.0, 5.0):  # на всякий случай два раза
         await asyncio.sleep(delay)
@@ -722,8 +848,24 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         log.info("skip offer: parse=%s chat_type=%s self_chat=%s", bool(data), msg.chat.type, msg.chat.id == msg.from_user.id)
         return  # молча игнорируем, чтобы не светить ошибки собеседнику
 
+    track(msg.from_user)
+    refusal = gate_offer(msg.from_user.id, msg.chat.id)
+    if refusal:
+        log.info("offer blocked by gate: buyer=%s target=%s", msg.from_user.id, msg.chat.id)
+        bump("gate_blocked")
+        try:  # ответ — только владельцу в личку, собеседник ничего не видит
+            await bot.send_message(msg.from_user.id, refusal)
+        except TelegramAPIError:
+            pass
+        if not is_allowed(msg.from_user.id) and msg.from_user.id not in _NOTIFIED:
+            _NOTIFIED.add(msg.from_user.id)
+            await notify_admin(bot, f"🚫 Попытка отправить оффер без доступа: {who(msg.from_user.id)}",
+                               user_id=msg.from_user.id)
+        return
+
     o = {
         "id": uuid.uuid4().hex[:10],
+        "created": time.time(),
         "buyer_id": msg.from_user.id,
         "target_id": msg.chat.id,
         "target_name": msg.chat.full_name,
@@ -737,6 +879,13 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         "seller_name": None,
         "msgs": {},
     }
+    problem = await check_offer(o)
+    if problem:
+        try:
+            await bot.send_message(msg.from_user.id, problem)
+        except TelegramAPIError:
+            pass
+        return
     mid, edited, err = None, False, None
     text, kb, lp = render(o, "shared", bc_id)
 
@@ -767,6 +916,12 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         except TelegramAPIError as e:
             err = e
             errs.append(f"{flags or 'full'}: {type(e).__name__}: {e}")
+            if "PEER_FLOOD" in str(e):
+                bump("peer_flood")
+
+    if mid is not None:
+        bump("sent_new")
+        bump("variant:" + ("+".join(used) or "full"))
 
     if mid is not None and errs and used.get("no_buttons"):
         try:
@@ -788,6 +943,7 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             )
             mid, edited = msg.message_id, True
             log.info("offer: edited the owner's message in place (fallback)")
+            bump("sent_edit")
             # новое сообщение отправить не удалось — сообщаем владельцу почему (получатель в этом режиме часто ничего не видит)
             try:
                 await bot.send_message(
@@ -802,6 +958,8 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
             log.warning("edit in place failed: %s", e)
 
     if mid is None:
+        bump("send_failed")
+        log_event(f"оффер НЕ отправлен ({msg.from_user.id} → {msg.chat.id}): {err}")
         # сообщаем владельцу причину в личку с ботом (если он когда-то нажимал /start)
         try:
             await bot.send_message(
@@ -814,6 +972,9 @@ async def business_offer(msg: Message, args: str, bot: Bot, bc_id: str):
         return
     o["msgs"]["shared"] = (msg.chat.id, mid, bc_id)
     OFFERS[o["id"]] = o
+    record_offer(o)
+    log_event(f"оффер {o['id']} создан (business): {msg.from_user.id} → {msg.chat.id}, {o['title']}, "
+              f"{money(o)}, вариант {'+'.join(used) or 'full'}{', через правку' if edited else ''}")
 
     # Первая правка чужого сообщения доходит только до владельца, вторая — до получателя.
     # Поэтому через пару секунд правим ещё раз (убираем невидимый символ).
@@ -926,17 +1087,43 @@ async def on_action(cb: CallbackQuery):
         log.info("callback answer failed: %s", e)
 
 
+# ---------- СВЯЗЬ С АДМИН-ПАНЕЛЬЮ (сама панель — в admin_panel.py) ----------
+
+def admin_status() -> dict:
+    """Что панель показывает в /admin и /status: режим бета/боевой, оплата, настройки."""
+    return {
+        "live": PAYMENTS_LIVE,
+        "hooks": {
+            n: callable(getattr(payments, n, None))
+            for n in ("check_offer", "reserve_payment", "release_payment", "refund_payment", "setup")
+        },
+        "flags": {
+            "Бот": ("@" + BOT_USERNAME) if BOT_USERNAME else "—",
+            "Кнопки под оффером в бизнес-чате (OFFER_BUTTONS)": BUTTONS,
+            "Новое сообщение на каждый шаг сделки (OFFER_RESEND)": RESEND,
+            "Дубль оффера в личку получателю (OFFER_DM)": ALSO_DM,
+            "Кнопки-ссылки на бота (OFFER_DEEPLINK)": DEEPLINK,
+            "Файл состояния панели": str(STATE_FILE),
+        },
+    }
+
+
+attach_bot(offers=OFFERS, business=BUSINESS, status=admin_status, money=money)
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("Задай переменную окружения BOT_TOKEN")
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global BOT_USERNAME
     BOT_USERNAME = (await bot.me()).username or ""
-    log.info("bot username: %s, deeplink buttons: %s", BOT_USERNAME, DEEPLINK)
+    log.info("bot username: %s, deeplink buttons: %s, payments live: %s", BOT_USERNAME, DEEPLINK, PAYMENTS_LIVE)
+    if payments is not None and hasattr(payments, "setup"):
+        await payments.setup(bot)  # например, поднять веб-хук для карты/крипты
     await dp.start_polling(
         bot,
         allowed_updates=[
-            "message", "callback_query", "inline_query",
+            "message", "callback_query", "inline_query", "pre_checkout_query",
             "business_connection", "business_message",
             "edited_business_message", "deleted_business_messages",
         ],
